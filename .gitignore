@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.env
+.env.*
+.env.local
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Byte-compiled / optimized
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+
+# Data (do not commit large datasets)
+/data/
+
+# Logs
+*.log
+
+# Streamlit cache
+.streamlit/
+
+# Others
+coverage/
+htmlcov/
