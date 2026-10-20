@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ModelConfig
-from .data import load_partition_subset, prepare_lgb_dataset
+from .data import compute_fold_category_median_prices, load_partition_subset, prepare_lgb_dataset
 
 
 def select_best_objective(
@@ -23,22 +23,31 @@ def select_best_objective(
     val_origs: List[str],
     sampled_ids: Set[str],
     log: callable = print,
-) -> Tuple[str, pd.DataFrame]:
-    """Compare regression_l1 vs poisson on DEV_S2012 using Matrix A."""
+) -> Tuple[str, pd.DataFrame, Dict]:
+    """Compare regression_l1 vs poisson on DEV_S2012 using Matrix A with training-only price normalization."""
     log("Comparing candidate objectives on development fold (DEV_S2012)...")
     
-    # Load Matrix A data
+    # Compute category median price strictly from training origins (zero future price leakage)
+    fold_cat_medians = compute_fold_category_median_prices(train_origs, sampled_ids, cfg)
+    splits_df = pd.read_csv(cfg.split_manifest_path)
+    train_splits = splits_df[splits_df["origin_id"].isin(train_origs)]
+    cutoff_d = int(train_splits["last_target_d"].max())
+    cutoff_date = str(train_splits["last_target_date"].max())
+    log(f"  Objective selection price normalization: training cutoff d_{cutoff_d} ({cutoff_date}) | medians: {fold_cat_medians}")
+    
+    # Load Matrix A data using frozen training medians for both train and validation
     df_train, _, feat_cols, cat_cols = load_partition_subset(
-        cfg.matrix_A_dir, train_origs, sampled_ids, cfg
+        cfg.matrix_A_dir, train_origs, sampled_ids, cfg, fold_cat_medians=fold_cat_medians
     )
     df_val, _, _, _ = load_partition_subset(
-        cfg.matrix_A_dir, val_origs, sampled_ids, cfg
+        cfg.matrix_A_dir, val_origs, sampled_ids, cfg, fold_cat_medians=fold_cat_medians
     )
     
     trn_ds = prepare_lgb_dataset(df_train, feat_cols, cfg.label_col, cat_cols)
     val_ds = prepare_lgb_dataset(df_val, feat_cols, cfg.label_col, cat_cols, reference=trn_ds)
     
     y_val = df_val[cfg.label_col].to_numpy()
+
     
     results = []
     best_obj = None
@@ -101,7 +110,16 @@ def select_best_objective(
     gc.collect()
     
     log(f"Selected objective: '{best_obj}' with lowest validation MAE: {best_mae:.4f}")
-    return best_obj, pd.DataFrame(results)
+    audit_info = {
+        "train_origins": train_origs,
+        "val_origins": val_origs,
+        "cutoff_d": cutoff_d,
+        "cutoff_date": cutoff_date,
+        "category_medians": fold_cat_medians,
+        "selected_objective": best_obj,
+        "validation_mae": best_mae,
+    }
+    return best_obj, pd.DataFrame(results), audit_info
 
 
 def tune_hyperparameters(
@@ -111,15 +129,23 @@ def tune_hyperparameters(
     val_origs: List[str],
     sampled_ids: Set[str],
     log: callable = print,
-) -> Tuple[Dict, pd.DataFrame]:
-    """Run bounded hyperparameter search on development fold DEV_S2012."""
+) -> Tuple[Dict, pd.DataFrame, Dict]:
+    """Run bounded hyperparameter search on development fold DEV_S2012 with training-only price normalization."""
     log(f"Running hyperparameter grid search ({len(cfg.hyperparam_grid)} configurations)...")
     
+    # Compute category median price strictly from training origins (zero future price leakage)
+    fold_cat_medians = compute_fold_category_median_prices(train_origs, sampled_ids, cfg)
+    splits_df = pd.read_csv(cfg.split_manifest_path)
+    train_splits = splits_df[splits_df["origin_id"].isin(train_origs)]
+    cutoff_d = int(train_splits["last_target_d"].max())
+    cutoff_date = str(train_splits["last_target_date"].max())
+    log(f"  Hyperparameter tuning price normalization: training cutoff d_{cutoff_d} ({cutoff_date}) | medians: {fold_cat_medians}")
+    
     df_train, _, feat_cols, cat_cols = load_partition_subset(
-        cfg.matrix_A_dir, train_origs, sampled_ids, cfg
+        cfg.matrix_A_dir, train_origs, sampled_ids, cfg, fold_cat_medians=fold_cat_medians
     )
     df_val, _, _, _ = load_partition_subset(
-        cfg.matrix_A_dir, val_origs, sampled_ids, cfg
+        cfg.matrix_A_dir, val_origs, sampled_ids, cfg, fold_cat_medians=fold_cat_medians
     )
     
     trn_ds = prepare_lgb_dataset(df_train, feat_cols, cfg.label_col, cat_cols)
@@ -180,7 +206,16 @@ def tune_hyperparameters(
     gc.collect()
     
     log(f"Best hyperparameters selected (Val MAE: {best_mae:.4f}): {best_params}")
-    return best_params, pd.DataFrame(records)
+    audit_info = {
+        "train_origins": train_origs,
+        "val_origins": val_origs,
+        "cutoff_d": cutoff_d,
+        "cutoff_date": cutoff_date,
+        "category_medians": fold_cat_medians,
+        "best_hyperparameters": best_params,
+        "validation_mae": best_mae,
+    }
+    return best_params, pd.DataFrame(records), audit_info
 
 
 def train_single_model(
@@ -192,6 +227,7 @@ def train_single_model(
     params: Dict,
     cfg: ModelConfig,
     fold_cat_medians: Optional[Dict[str, float]] = None,
+    fold_day_C: Optional[pd.DataFrame] = None,
     log: callable = print,
 ) -> Dict:
     """Train one LightGBM model for specified matrix and origin partitions."""
@@ -202,11 +238,14 @@ def train_single_model(
     log(f"Training Model {matrix_name} ({len(train_origs)} train origins, {len(val_origs)} val origins)...")
     
     df_train, _, feat_cols, cat_cols = load_partition_subset(
-        matrix_dir, train_origs, sampled_ids, cfg, matrix_name=matrix_name, fold_cat_medians=fold_cat_medians
+        matrix_dir, train_origs, sampled_ids, cfg, matrix_name=matrix_name,
+        fold_cat_medians=fold_cat_medians, fold_day_C=fold_day_C
     )
     df_val, _, _, _ = load_partition_subset(
-        matrix_dir, val_origs, sampled_ids, cfg, matrix_name=matrix_name, fold_cat_medians=fold_cat_medians
+        matrix_dir, val_origs, sampled_ids, cfg, matrix_name=matrix_name,
+        fold_cat_medians=fold_cat_medians, fold_day_C=fold_day_C
     )
+
     
     trn_ds = prepare_lgb_dataset(df_train, feat_cols, cfg.label_col, cat_cols)
     val_ds = prepare_lgb_dataset(df_val, feat_cols, cfg.label_col, cat_cols, reference=trn_ds)

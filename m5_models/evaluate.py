@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from m5_features.events import PHASE_CATEGORIES
 from .benchmark import SeasonalNaiveBenchmark
 from .config import ModelConfig
 from .data import load_partition_subset
@@ -57,10 +58,12 @@ def predict_evaluation_origins(
     sampled_ids: Set[str],
     cfg: ModelConfig,
     fold_cat_medians: Optional[Dict[str, float]] = None,
+    fold_day_C: Optional[pd.DataFrame] = None,
     log: callable = print,
 ) -> pd.DataFrame:
     """Generate predictions for benchmark, Model A, Model B, Model C, and Model D on eval origins."""
     log(f"Evaluating {len(eval_origs)} origins for fold {fold_id} across Benchmark, A, B, C, and D...")
+
     
     # We will load origin by origin to keep memory light (< 100 MB per origin)
     all_preds_list = []
@@ -134,18 +137,30 @@ def predict_evaluation_origins(
         coords["t_no_event"] = df_B["t_no_event"].to_numpy()
         
         # 5. Model C prediction
-        p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
-        tbl_C = pq.ParquetFile(p_C).read()
-        df_C = tbl_C.to_pandas()
-        df_C = df_C[df_C["id"].isin(sampled_ids)].reset_index(drop=True)
-        if fold_cat_medians is not None and "last_price_known_at_origin" in df_C.columns and "cat_id" in df_C.columns:
-            denom = df_C["cat_id"].map(fold_cat_medians).astype(float)
-            df_C["price_ratio_to_cat_median"] = np.where(
-                df_C["last_price_known_at_origin"].notna(),
-                df_C["last_price_known_at_origin"] / denom,
-                np.nan
-            ).astype(np.float32)
+        if fold_day_C is not None:
+            day_C_indexed = fold_day_C.set_index("d_num")
+            c_cols = [c for c in fold_day_C.columns if c != "d_num"]
+            df_C_feats = day_C_indexed[c_cols].loc[df_B["target_d"]].reset_index(drop=True)
+            b_event_cols = {"t_event_name_1", "t_event_type_1", "t_event_name_2", "t_event_type_2"}
+            base_cols_C = [c for c in df_B.columns if c not in b_event_cols]
+            df_C = pd.concat([df_B[base_cols_C], df_C_feats], axis=1)
+        else:
+            p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
+            tbl_C = pq.ParquetFile(p_C).read()
+            df_C = tbl_C.to_pandas()
+            df_C = df_C[df_C["id"].isin(sampled_ids)].reset_index(drop=True)
+            if fold_cat_medians is not None and "last_price_known_at_origin" in df_C.columns and "cat_id" in df_C.columns:
+                denom = df_C["cat_id"].map(fold_cat_medians).astype(float)
+                df_C["price_ratio_to_cat_median"] = np.where(
+                    df_C["last_price_known_at_origin"].notna(),
+                    df_C["last_price_known_at_origin"] / denom,
+                    np.nan
+                ).astype(np.float32)
             
+        for c in df_C.columns:
+            if c.startswith("ph_"):
+                df_C[c] = pd.Categorical(df_C[c], categories=PHASE_CATEGORIES)
+                
         feat_C = models["model_C"]["feature_cols"]
         for c in models["model_C"]["cat_cols"]:
             df_C[c] = df_C[c].astype("category")
@@ -162,8 +177,22 @@ def predict_evaluation_origins(
             
         # 6. Model D prediction (Matrix B + C event-window features)
         if "model_D" in models:
-            c_extra = [c for c in df_C.columns if c.startswith("ph_") or c.startswith("k_")]
-            df_D = pd.concat([df_B, df_C[c_extra]], axis=1)
+            if fold_day_C is not None:
+                day_C_indexed = fold_day_C.set_index("d_num")
+                c_extra = [c for c in fold_day_C.columns if c.startswith("ph_") or c.startswith("k_") or c.startswith("n_fam_") or c.startswith("span_")]
+                df_C_extra = day_C_indexed[c_extra].loc[df_B["target_d"]].reset_index(drop=True)
+            else:
+                c_extra = [c for c in df_C.columns if c.startswith("ph_") or c.startswith("k_")]
+                df_C_extra = df_C[c_extra].reset_index(drop=True)
+            
+            assert len(df_B) == len(df_C_extra), (
+                f"Row mismatch between B ({len(df_B)}) and C extra ({len(df_C_extra)}) in origin {orig_id}"
+            )
+            df_D = pd.concat([df_B, df_C_extra], axis=1)
+            for c in df_D.columns:
+                if c.startswith("ph_"):
+                    df_D[c] = pd.Categorical(df_D[c], categories=PHASE_CATEGORIES)
+                    
             feat_D = models["model_D"]["feature_cols"]
             for c in models["model_D"]["cat_cols"]:
                 df_D[c] = df_D[c].astype("category")

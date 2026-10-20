@@ -348,11 +348,12 @@ def generate_evaluation_artifacts(
     
     eval_summary_md.extend([
         "",
-        "## 2. Frozen Final Test Performance (Holiday Season 2015 + Evaluation Period)",
+        "## 2. 2015 Exploratory Test Evaluation (Holiday Season 2015 + Evaluation Period)",
         "",
         "> [!IMPORTANT]",
-        "> **Standalone Untouched Test Result**: The final test fold (`FINAL_TEST`) begins at target day $d\\_1736$ (2015-10-30).",
-        "> Model features, objective selection (`regression_l1`), hyperparameters, and clipping rules were frozen prior to opening these test labels.",
+        "> **Exploratory Evaluation Status**: The final test fold (`FINAL_TEST`) evaluates rolling origins from target day $d\\_1736$ (2015-10-30) onward.",
+        "> Because aggregate 2015 metrics were inspected in preliminary research rounds, this test evaluation is designated as **EXPLORATORY** rather than an untouched confirmatory test.",
+        "> Models were trained strictly on observations dated prior to test start with frozen hyperparameters, and event screening was conducted chronologically using history up to cutoff day $d\\_1717$.",
         "",
         f"- **Evaluation Scope**: 15 rolling forecast origins ($O \\in [1735, 1913]$, targets $d \\in [1736, 1941]$) spanning Christmas 2015, Thanksgiving 2015, and the official M5 public evaluation period.",
         f"- **Total Test Predictions**: {final_test_row['number_of_predictions']:,} rows.",
@@ -405,10 +406,13 @@ def generate_evaluation_artifacts(
         "",
         "> [!NOTE]",
         "> Detailed audit and SKU-by-SKU outcomes are saved in [sku_attention_report.md](file:///outputs/m5_models/sku_attention_report.md).",
-        f"- **Calibration Scope**: Calibrated strictly on development holiday episodes (`DEV_S2012`–`DEV_S2014`) by ranking 28-day cumulative order discrepancies between Model B and Model D.",
-        "- **Review List Size**: Top 50 highest-discrepancy SKU-store pairs (1.6% of series).",
-        "- **Exploratory 2015 Evaluation**: Examines whether attending to high-discrepancy SKUs improves 2015 holiday forecasting, while rigorously reporting regressions where Model D underperforms Model B.",
+        f"- **Calibration Scope**: Calibrated strictly on development holiday origins (`DEV_S2012`–`DEV_S2014`) by ranking 28-day cumulative forecast disagreement between Model B and Model D.",
+        "- **Operational Meaning**: The score measures forecast-implied 28-day order quantity difference / forecast disagreement, NOT actual inventory orders.",
+        "- **Review List Capacity**: Fixed at Top 50 highest-disagreement SKU-store pairs (1.6% of series).",
+        "- **Exploratory 2015 Evaluation**: Because 2015 results were previously inspected, this analysis is strictly EXPLORATORY. Model D is NOT automatically superior for flagged SKUs; disagreement flags SKUs for closer human review.",
+        "- **No Premature Inventory Claims**: No claim is made that the attention rule increases profit or reduces stockouts; those operational outcomes require a downstream inventory simulation.",
     ])
+
 
     (out_dir / "evaluation_summary.md").write_text("\n".join(eval_summary_md), encoding="utf-8")
     saved_files["eval_summary_md"] = out_dir / "evaluation_summary.md"

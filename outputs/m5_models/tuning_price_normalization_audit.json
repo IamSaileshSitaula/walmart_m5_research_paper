@@ -1,0 +1,84 @@
+{
+  "objective_selection": {
+    "train_origins": [
+      "O0373",
+      "O0401",
+      "O0429",
+      "O0457",
+      "O0485",
+      "O0513",
+      "O0541",
+      "O0569",
+      "O0597"
+    ],
+    "val_origins": [
+      "O0636",
+      "O0643",
+      "O0650",
+      "O0653",
+      "O0657",
+      "O0669",
+      "O0676",
+      "O0681",
+      "O0683",
+      "O0690"
+    ],
+    "cutoff_d": 625,
+    "cutoff_date": "2012-10-14",
+    "category_medians": {
+      "FOODS": 2.5,
+      "HOBBIES": 3.9700000286102295,
+      "HOUSEHOLD": 4.96999979019165
+    },
+    "selected_objective": "regression_l1",
+    "validation_mae": 1.1119847407378984
+  },
+  "hyperparameter_tuning": {
+    "train_origins": [
+      "O0373",
+      "O0401",
+      "O0429",
+      "O0457",
+      "O0485",
+      "O0513",
+      "O0541",
+      "O0569",
+      "O0597"
+    ],
+    "val_origins": [
+      "O0636",
+      "O0643",
+      "O0650",
+      "O0653",
+      "O0657",
+      "O0669",
+      "O0676",
+      "O0681",
+      "O0683",
+      "O0690"
+    ],
+    "cutoff_d": 625,
+    "cutoff_date": "2012-10-14",
+    "category_medians": {
+      "FOODS": 2.5,
+      "HOBBIES": 3.9700000286102295,
+      "HOUSEHOLD": 4.96999979019165
+    },
+    "best_hyperparameters": {
+      "objective": "regression_l1",
+      "metric": "mae",
+      "verbose": -1,
+      "n_jobs": 8,
+      "seed": 42,
+      "bagging_freq": 1,
+      "learning_rate": 0.1,
+      "num_leaves": 63,
+      "min_data_in_leaf": 100,
+      "feature_fraction": 0.8,
+      "bagging_fraction": 0.8,
+      "reg_alpha": 0.5,
+      "reg_lambda": 1.0
+    },
+    "validation_mae": 1.110182956106522
+  }
+}

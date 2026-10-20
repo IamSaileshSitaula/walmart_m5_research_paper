@@ -6,7 +6,9 @@ in advance (documented assumption). They are broadcast to rows by target day.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import re
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,8 @@ from .config import SPAN_PAIRS, FeatureConfig
 
 NONE = "none"
 OUTSIDE = "outside"
+PHASE_CATEGORIES = [OUTSIDE, "pre_14_8", "pre_7_2", "pre_1", "day_0", "post_1_3", "post_4_7"]
+
 
 
 def slug(s: str) -> str:
@@ -177,3 +181,62 @@ def day_level_event_features(cal: pd.DataFrame, ev: pd.DataFrame, sel: pd.DataFr
                  "occurrences_represented_in_C": int(represented.sum()),
                  "days_where_C_misses_an_event": int((represented != B["t_event_count"].to_numpy()).sum())}
     return B, C, named, families, rep_check
+
+
+def load_store_daily_totals(panel_path: Path, cache_path: Optional[Path] = None) -> np.ndarray:
+    """Load or compute store daily sales totals matrix (n_stores, n_days) from cleaned panel."""
+    if cache_path is not None and cache_path.exists():
+        return np.load(cache_path)
+    import pyarrow.parquet as pq
+    tbl = pq.read_table(panel_path, columns=["store_id", "d_num", "units_sold"])
+    df = tbl.to_pandas()
+    g = df.groupby(["store_id", "d_num"], observed=True)["units_sold"].sum().unstack("d_num").fillna(0)
+    totals = g.to_numpy(dtype=np.float64)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, totals)
+    return totals
+
+
+def compute_fold_event_selection(
+    fold_id: str,
+    cutoff_d: int,
+    store_daily_totals: np.ndarray,
+    cal: pd.DataFrame,
+    ev: pd.DataFrame,
+    cfg: FeatureConfig,
+) -> dict:
+    """Compute strictly chronological event screening and day_C representation for a fold.
+    
+    Uses only sales history through cutoff_d (the maximum target day in fold's training origins).
+    Preserves calendar-known prespecified thesis events (Thanksgiving, Christmas) as named.
+    Screens all other events strictly using eligible historical occurrences prior to cutoff_d.
+    """
+    T_fold = store_daily_totals[:, :cutoff_d]
+    sel_events, effect_profiles = select_events(T_fold, ev, cfg)
+    sel_events.insert(0, "cutoff_d", cutoff_d)
+    sel_events.insert(0, "fold_id", fold_id)
+    
+    day_B, day_C, named_list, family_list, rep_chk = day_level_event_features(cal, ev, sel_events, cfg)
+    
+    # Ensure all phase columns in day_C have consistent categorical types
+    for col in day_C.columns:
+        if col.startswith("ph_"):
+            day_C[col] = pd.Categorical(day_C[col], categories=PHASE_CATEGORIES)
+        elif col.startswith("k_"):
+            day_C[col] = day_C[col].astype(np.float32)
+            
+    feature_schema = [c for c in day_C.columns if c != "d_num"]
+    
+    return {
+        "fold_id": fold_id,
+        "cutoff_d": cutoff_d,
+        "sel_events": sel_events,
+        "effect_profiles": effect_profiles,
+        "day_C": day_C,
+        "named_events": named_list,
+        "pooled_events": sel_events.loc[sel_events["decision"] == "pooled", "event_name"].tolist(),
+        "feature_schema": feature_schema,
+        "rep_chk": rep_chk,
+    }
+

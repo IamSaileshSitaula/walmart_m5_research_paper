@@ -58,6 +58,9 @@ def compute_fold_category_median_prices(
     return cat_medians
 
 
+from m5_features.events import PHASE_CATEGORIES
+
+
 def load_partition_subset(
     matrix_dir: Path,
     origin_ids: List[str],
@@ -65,12 +68,14 @@ def load_partition_subset(
     cfg: ModelConfig,
     matrix_name: Optional[str] = None,
     fold_cat_medians: Optional[Dict[str, float]] = None,
+    fold_day_C: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
     """Load and concatenate data for specified origins and study population.
     
     Retains forecast horizon 'h' as an explicit numeric predictor.
-    Supports Matrix D = Matrix B (same-day events) + Matrix C (event-window phase and timing).
+    Supports Matrix C and D with fold-specific chronological event mapping (fold_day_C).
     Applies fold-specific category median price normalization if provided.
+    Asserts exact coordinate and row alignment across matrices.
     """
     dfs = []
     coords_dfs = []
@@ -79,6 +84,7 @@ def load_partition_subset(
     drop_from_X = set(cfg.feature_excluded_cols + [cfg.label_col])
     
     is_matrix_D = (matrix_name is not None and ("model_D" in matrix_name or "matrix_D" in matrix_name)) or (matrix_dir.name in ["matrix_D", "model_D"])
+    is_matrix_C = (matrix_name is not None and ("model_C" in matrix_name or "matrix_C" in matrix_name)) or (matrix_dir.name in ["matrix_C", "model_C"])
     
     feature_cols = None
     cat_cols = None
@@ -86,20 +92,51 @@ def load_partition_subset(
     for orig_id in origin_ids:
         if is_matrix_D:
             p_B = cfg.matrix_B_dir / f"origin_id={orig_id}" / "data.parquet"
-            p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
-            if not p_B.exists() or not p_C.exists():
+            if not p_B.exists():
                 continue
-            
             df_B = pq.ParquetFile(p_B).read().to_pandas()
             b_mask = df_B["id"].isin(sampled_ids).to_numpy()
             df_B_sub = df_B[b_mask].reset_index(drop=True)
             
-            pf_C = pq.ParquetFile(p_C)
-            c_extra = [c for c in pf_C.schema.names if c.startswith("ph_") or c.startswith("k_")]
-            df_C_extra = pf_C.read(columns=c_extra).to_pandas()
-            df_C_sub = df_C_extra[b_mask].reset_index(drop=True)
+            if fold_day_C is not None:
+                day_C_indexed = fold_day_C.set_index("d_num")
+                c_extra = [c for c in fold_day_C.columns if c.startswith("ph_") or c.startswith("k_") or c.startswith("n_fam_") or c.startswith("span_")]
+                df_C_sub = day_C_indexed[c_extra].loc[df_B_sub["target_d"]].reset_index(drop=True)
+            else:
+                p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
+                if not p_C.exists():
+                    continue
+                pf_C = pq.ParquetFile(p_C)
+                c_extra = [c for c in pf_C.schema.names if c.startswith("ph_") or c.startswith("k_")]
+                df_C_extra = pf_C.read(columns=c_extra).to_pandas()
+                df_C_sub = df_C_extra[b_mask].reset_index(drop=True)
             
+            assert len(df_B_sub) == len(df_C_sub), (
+                f"Row count mismatch between B ({len(df_B_sub)}) and C ({len(df_C_sub)}) for origin {orig_id}"
+            )
             df_sub = pd.concat([df_B_sub, df_C_sub], axis=1)
+        elif is_matrix_C and fold_day_C is not None:
+            p_A = cfg.matrix_A_dir / f"origin_id={orig_id}" / "data.parquet"
+            p_B = cfg.matrix_B_dir / f"origin_id={orig_id}" / "data.parquet"
+            if not (p_A.exists() and p_B.exists()):
+                continue
+            df_A = pq.ParquetFile(p_A).read().to_pandas()
+            a_mask = df_A["id"].isin(sampled_ids).to_numpy()
+            df_sub_base = df_A[a_mask].reset_index(drop=True)
+            
+            df_B_events = pq.ParquetFile(p_B).read(columns=["id", "t_event_count", "t_no_event"]).to_pandas()
+            df_B_sub_ev = df_B_events[a_mask].reset_index(drop=True)
+            assert (df_sub_base["id"].to_numpy() == df_B_sub_ev["id"].to_numpy()).all(), (
+                f"ID mismatch between A and B for origin {orig_id}"
+            )
+            df_sub_base["t_event_count"] = df_B_sub_ev["t_event_count"].to_numpy()
+            df_sub_base["t_no_event"] = df_B_sub_ev["t_no_event"].to_numpy()
+            
+            day_C_indexed = fold_day_C.set_index("d_num")
+            c_cols = [c for c in fold_day_C.columns if c != "d_num"]
+            df_C_feats = day_C_indexed[c_cols].loc[df_sub_base["target_d"]].reset_index(drop=True)
+            assert len(df_sub_base) == len(df_C_feats)
+            df_sub = pd.concat([df_sub_base, df_C_feats], axis=1)
         else:
             p = matrix_dir / f"origin_id={orig_id}" / "data.parquet"
             if not p.exists():
@@ -122,6 +159,11 @@ def load_partition_subset(
                 np.nan
             ).astype(np.float32)
             
+        # Ensure all phase columns have unified categorical type
+        for c in df_sub.columns:
+            if c.startswith("ph_"):
+                df_sub[c] = pd.Categorical(df_sub[c], categories=PHASE_CATEGORIES)
+            
         if feature_cols is None:
             feature_cols = [c for c in df_sub.columns if c not in drop_from_X]
             # Ensure 'h' is present
@@ -139,6 +181,7 @@ def load_partition_subset(
             df_sub[c] = df_sub[c].astype("category")
             
         dfs.append(df_sub[feature_cols + [cfg.label_col]])
+
         
     if not dfs:
         raise ValueError(f"No data loaded for origins: {origin_ids}")

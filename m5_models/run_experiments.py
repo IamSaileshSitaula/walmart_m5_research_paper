@@ -13,6 +13,13 @@ import pandas as pd
 import lightgbm as lgb
 import pyarrow.parquet as pq
 
+from m5_features.config import FeatureConfig
+from m5_features.events import (
+    compute_fold_event_selection,
+    event_date_table,
+    load_store_daily_totals,
+)
+from m5_features.inputs import load_calendar
 from .audit import run_pre_training_audit
 from .benchmark import SeasonalNaiveBenchmark
 from .config import ModelConfig
@@ -20,6 +27,7 @@ from .data import compute_fold_category_median_prices, get_study_population_seri
 from .evaluate import predict_evaluation_origins
 from .reporting import generate_evaluation_artifacts
 from .train import select_best_objective, train_single_model, tune_hyperparameters
+
 
 
 def main(argv=None) -> int:
@@ -84,12 +92,22 @@ def main(argv=None) -> int:
     # -------------------------------------------------------------------------
     # 3. Development-Only Objective Selection
     # -------------------------------------------------------------------------
-    best_obj, obj_df = select_best_objective(cfg, dev_s2012_train, dev_s2012_val, sampled_ids, log)
+    best_obj, obj_df, obj_audit = select_best_objective(cfg, dev_s2012_train, dev_s2012_val, sampled_ids, log)
 
     # -------------------------------------------------------------------------
     # 4. Development-Only Hyperparameter Grid Search
     # -------------------------------------------------------------------------
-    best_params, tuning_df = tune_hyperparameters(cfg, best_obj, dev_s2012_train, dev_s2012_val, sampled_ids, log)
+    best_params, tuning_df, tune_audit = tune_hyperparameters(cfg, best_obj, dev_s2012_train, dev_s2012_val, sampled_ids, log)
+
+    # Save tuning price normalization audit artifact
+    tuning_audit_data = {
+        "objective_selection": obj_audit,
+        "hyperparameter_tuning": tune_audit,
+    }
+    (out_dir / "tuning_price_normalization_audit.json").write_text(
+        json.dumps(tuning_audit_data, indent=2), encoding="utf-8"
+    )
+    log(f"Saved tuning price normalization audit -> {out_dir / 'tuning_price_normalization_audit.json'}")
 
     # -------------------------------------------------------------------------
     # 5. Seasonal-Naive Benchmark Initialization
@@ -98,7 +116,67 @@ def main(argv=None) -> int:
     benchmark = SeasonalNaiveBenchmark(cfg)
 
     # -------------------------------------------------------------------------
-    # 6. Fit Fold-Specific Models and Evaluate Chronologically
+    # 6. Chronological Per-Fold Event Screening & Feature Representation
+    # -------------------------------------------------------------------------
+    log("=" * 80)
+    log("COMPUTING CHRONOLOGICAL FOLD-SPECIFIC EVENT SCREENING AND FEATURE SCHEMAS")
+    log("=" * 80)
+
+    cal = load_calendar(Path("outputs/m5_cleaning/features/calendar_event_features.parquet"))
+    ev = event_date_table(cal, test_start=1736)
+
+    cache_totals = Path(cfg.manifest_dir) / "store_daily_totals.npy"
+    store_totals = load_store_daily_totals(cfg.cleaned_panel_path, cache_path=cache_totals)
+
+    cfg_feat = FeatureConfig(
+        panel_path=cfg.cleaned_panel_path,
+        calendar_features_path=Path("outputs/m5_cleaning/features/calendar_event_features.parquet"),
+        cleaning_manifest_path=Path("outputs/m5_cleaning/review/cleaning_manifest.json"),
+        out_dir=Path(cfg.features_dir),
+    )
+
+    fold_day_C_map = {}
+    fold_screening_summary = []
+    manifests_dir = out_dir / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    features_manifest_dir = Path(cfg.manifest_dir)
+    features_manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in folds_df.itertuples():
+        fold_id = f.fold_id
+        trn_rows = splits_df[(splits_df["fold_id"] == fold_id) & (splits_df["role"] == "train")]
+        cutoff_d = int(trn_rows["last_target_d"].max())
+        cutoff_date = str(trn_rows["last_target_date"].max())
+
+        fold_ev_res = compute_fold_event_selection(fold_id, cutoff_d, store_totals, cal, ev, cfg_feat)
+        fold_day_C_map[fold_id] = fold_ev_res["day_C"]
+
+        # Save per-fold event selection CSV (both in m5_models and m5_features manifests)
+        sel_csv_path = manifests_dir / f"event_selection_{fold_id}.csv"
+        fold_ev_res["sel_events"].to_csv(sel_csv_path, index=False)
+        fold_ev_res["sel_events"].to_csv(features_manifest_dir / f"event_selection_{fold_id}.csv", index=False)
+
+        n_named = len(fold_ev_res["named_events"])
+        n_pooled = len(fold_ev_res["pooled_events"])
+        log(f"  Fold {fold_id:12s} | Cutoff d_{cutoff_d} ({cutoff_date}) | Named ({n_named}): {fold_ev_res['named_events']} | Pooled: {n_pooled}")
+
+        fold_screening_summary.append({
+            "fold_id": fold_id,
+            "cutoff_d": cutoff_d,
+            "cutoff_date": cutoff_date,
+            "n_named_events": n_named,
+            "n_pooled_events": n_pooled,
+            "named_events": "; ".join(fold_ev_res["named_events"]),
+            "n_features_C": len(fold_ev_res["feature_schema"]),
+        })
+
+    df_fold_summary = pd.DataFrame(fold_screening_summary)
+    df_fold_summary.to_csv(manifests_dir / "fold_event_screening_summary.csv", index=False)
+    df_fold_summary.to_csv(features_manifest_dir / "fold_event_screening_summary.csv", index=False)
+    log(f"Saved fold event screening manifests to {manifests_dir} and {features_manifest_dir}")
+
+    # -------------------------------------------------------------------------
+    # 7. Fit Fold-Specific Models and Evaluate Chronologically
     # -------------------------------------------------------------------------
     log("=" * 80)
     log("EXECUTING STRICT CHRONOLOGICAL TRAINING AND OUT-OF-SAMPLE EVALUATION BY FOLD")
@@ -138,6 +216,9 @@ def main(argv=None) -> int:
         fold_cat_medians = compute_fold_category_median_prices(trn_origs, sampled_ids, cfg)
         log(f"  Fold training category median prices (zero lookahead): {fold_cat_medians}")
 
+        # Fold-specific event feature lookup table
+        fold_day_C = fold_day_C_map[fold_id]
+
         # Validation split within training origins for early stopping (last 15% or at least 2 origins)
         val_count = max(2, int(len(trn_origs) * 0.15))
         sub_train = trn_origs[:-val_count]
@@ -146,12 +227,12 @@ def main(argv=None) -> int:
         # Train fold-specific models for Matrix A, B, C, and D
         fold_models = {}
         model_specs = [
-            ("model_A", cfg.matrix_A_dir),
-            ("model_B", cfg.matrix_B_dir),
-            ("model_C", cfg.matrix_C_dir),
-            ("model_D", cfg.matrix_B_dir),
+            ("model_A", cfg.matrix_A_dir, None),
+            ("model_B", cfg.matrix_B_dir, None),
+            ("model_C", cfg.matrix_C_dir, fold_day_C),
+            ("model_D", cfg.matrix_B_dir, fold_day_C),
         ]
-        for mat_name, mat_dir in model_specs:
+        for mat_name, mat_dir, f_day_C in model_specs:
             m_res = train_single_model(
                 matrix_dir=mat_dir,
                 matrix_name=f"{fold_id}_{mat_name}",
@@ -161,6 +242,7 @@ def main(argv=None) -> int:
                 params=best_params,
                 cfg=cfg,
                 fold_cat_medians=fold_cat_medians,
+                fold_day_C=f_day_C,
                 log=log,
             )
             fold_models[mat_name] = m_res
@@ -182,9 +264,11 @@ def main(argv=None) -> int:
             sampled_ids=sampled_ids,
             cfg=cfg,
             fold_cat_medians=fold_cat_medians,
+            fold_day_C=fold_day_C,
             log=log,
         )
         eval_predictions_by_fold.append(fold_preds)
+
 
     full_preds_df = pd.concat(eval_predictions_by_fold, ignore_index=True)
     log(f"All out-of-sample predictions assembled: {len(full_preds_df):,} total forecast rows.")
