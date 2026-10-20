@@ -1,0 +1,3 @@
+comparison,mean_delta_mae,pct_delta_mae,t_statistic,p_value_ttest,wilcoxon_stat,p_value_wilcoxon,conclusion
+B - A (Value of Same-Day Event Names),-0.0073734086514765625,-0.7464937485492337,-5.51034404142679,3.5989492199857513e-08,282708464.5,8.71278701301756e-05,B significantly outperforms A
+C - B (Additional Value of Event Timing & Phase),-0.004702481492871429,-0.47966619067979255,-6.425801172030313,1.3235325843388585e-10,275920994.0,1.3342865168030353e-14,C significantly outperforms B

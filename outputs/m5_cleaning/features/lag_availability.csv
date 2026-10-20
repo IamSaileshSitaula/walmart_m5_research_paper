@@ -1,0 +1,10 @@
+lag_days,proposed_for_model,valid_horizons,invalid_horizons,valid_for_all_28
+1,False,1..1,2..28,False
+7,False,1..7,8..28,False
+14,False,1..14,15..28,False
+28,True,1..28,none,True
+35,True,1..28,none,True
+42,True,1..28,none,True
+49,True,1..28,none,True
+56,True,1..28,none,True
+364,True,1..28,none,True

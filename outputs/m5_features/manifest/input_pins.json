@@ -1,0 +1,17 @@
+{
+  "cleaned_panel": {
+    "path": "C:\\Users\\saile\\OneDrive\\Desktop\\research\\outputs\\m5_cleaning\\panel\\m5_daily_item_store_clean.parquet",
+    "sha256": "c029d1dc0b05af310f55f5675c146be2b525e073076b59227d9def86e4f47c7d",
+    "size_bytes": 262399068
+  },
+  "calendar_features": {
+    "path": "C:\\Users\\saile\\OneDrive\\Desktop\\research\\outputs\\m5_cleaning\\features\\calendar_event_features.parquet",
+    "sha256": "fb6859839e61a73fe26ff1281f919dcfba9d0be6373ec94f6ad2903b6eac3efe",
+    "size_bytes": 99461
+  },
+  "cleaning_manifest": {
+    "path": "C:\\Users\\saile\\OneDrive\\Desktop\\research\\outputs\\m5_cleaning\\run_manifest.json",
+    "sha256": "bad4cbdd5bf68f6f4ec7b8313dff6367ff43f1400b5cf43e097cbaeedf6e86cb",
+    "size_bytes": 3959
+  }
+}

@@ -1,0 +1,6 @@
+fold_id,fold_kind,eval_role,eval_target_start_d,eval_target_end_d,n_train_origins,n_eval_origins,description
+DEV_S2012,development_holiday_season,validation,637,718,9,10,Holiday season 2012-13: Thanksgiving 2012 lead origins through Christmas 2012 + 21d
+DEV_S2013,development_holiday_season,validation,1008,1083,30,10,Holiday season 2013-14: Thanksgiving 2013 lead origins through Christmas 2013 + 21d
+DEV_S2014,development_holiday_season,validation,1372,1448,51,10,Holiday season 2014-15: Thanksgiving 2014 lead origins through Christmas 2014 + 21d
+DEV_ORD,development_ordinary_and_other_events,validation,1466,1717,63,9,Non-overlapping base origins between the last development season and the final-test block
+FINAL_TEST,final_test,test,1736,1941,72,15,Holiday season 2015 (last complete Thanksgiving/Christmas) and all later origins incl. the M5 public window d_1914-d_1941; model frozen on targets < test start

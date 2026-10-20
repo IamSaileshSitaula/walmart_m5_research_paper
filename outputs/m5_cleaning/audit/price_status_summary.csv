@@ -1,0 +1,7 @@
+price_status,daily_rows,daily_rows_with_positive_sales,units_sold_raw,series_weeks,series_with_any
+listed,46881677,18939271,66927173,6719161,30490
+unpriced_before_first_listed,12299413,0,0,1757059,19558
+unpriced_within_listed_span,0,0,0,0,0
+unpriced_after_last_listed,0,0,0,0,0
+series_never_priced,0,0,0,0,0
+calendar_join_failed,0,0,0,0,0

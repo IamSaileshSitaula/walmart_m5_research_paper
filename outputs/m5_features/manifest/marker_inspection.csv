@@ -1,0 +1,23 @@
+span,year,start_marker,end_marker,start_d,end_d,span_days,decision
+nba_finals,2011.0,NBAFinalsStart,NBAFinalsEnd,123.0,135.0,13.0,span formed from both listed markers
+nba_finals,2012.0,NBAFinalsStart,NBAFinalsEnd,501.0,510.0,10.0,span formed from both listed markers
+nba_finals,2013.0,NBAFinalsStart,NBAFinalsEnd,860.0,874.0,15.0,span formed from both listed markers
+nba_finals,2014.0,NBAFinalsStart,NBAFinalsEnd,1224.0,1234.0,11.0,span formed from both listed markers
+nba_finals,2015.0,NBAFinalsStart,NBAFinalsEnd,1588.0,1600.0,13.0,span formed from both listed markers
+nba_finals,2016.0,NBAFinalsStart,NBAFinalsEnd,1952.0,1969.0,18.0,span formed from both listed markers
+ramadan,2011.0,Ramadan starts,Eid al-Fitr,185.0,215.0,30.0,span formed from both listed markers
+ramadan,2012.0,Ramadan starts,Eid al-Fitr,539.0,569.0,30.0,span formed from both listed markers
+ramadan,2013.0,Ramadan starts,Eid al-Fitr,893.0,923.0,30.0,span formed from both listed markers
+ramadan,2014.0,Ramadan starts,Eid al-Fitr,1248.0,1278.0,30.0,span formed from both listed markers
+ramadan,2015.0,Ramadan starts,Eid al-Fitr,1602.0,1632.0,30.0,span formed from both listed markers
+ramadan,2016.0,Ramadan starts,Eid al-Fitr,1957.0,,,incomplete pair in calendar - span NOT formed; markers used as anchors only
+lent,2011.0,LentStart,Easter,40.0,86.0,46.0,span formed from both listed markers
+lent,2012.0,LentStart,Easter,390.0,436.0,46.0,span formed from both listed markers
+lent,2013.0,LentStart,Easter,747.0,793.0,46.0,span formed from both listed markers
+lent,2014.0,LentStart,Easter,1132.0,1178.0,46.0,span formed from both listed markers
+lent,2015.0,LentStart,Easter,1482.0,1528.0,46.0,span formed from both listed markers
+lent,2016.0,LentStart,Easter,1839.0,1885.0,46.0,span formed from both listed markers
+,,,Chanukah End,,,,end_marker without a listed partner: anchored at the listed date; true start/duration unknown and not inferred
+,,,,,,,period_marker without a listed partner: anchored at the listed date; true start/duration unknown and not inferred
+,,,Pesach End,,,,end_marker without a listed partner: anchored at the listed date; true start/duration unknown and not inferred
+,,,Purim End,,,,end_marker without a listed partner: anchored at the listed date; true start/duration unknown and not inferred

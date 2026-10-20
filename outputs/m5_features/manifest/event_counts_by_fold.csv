@@ -1,0 +1,62 @@
+fold_id,event_name,occurrences_in_eval_period
+DEV_S2012,EidAlAdha,1
+DEV_S2012,Halloween,1
+DEV_S2012,VeteransDay,1
+DEV_S2012,Thanksgiving,1
+DEV_S2012,Chanukah End,1
+DEV_S2012,Christmas,1
+DEV_S2012,NewYear,1
+DEV_S2012,OrthodoxChristmas,1
+DEV_S2013,VeteransDay,1
+DEV_S2013,Thanksgiving,1
+DEV_S2013,Chanukah End,1
+DEV_S2013,Christmas,1
+DEV_S2013,NewYear,1
+DEV_S2013,OrthodoxChristmas,1
+DEV_S2014,Halloween,1
+DEV_S2014,VeteransDay,1
+DEV_S2014,Thanksgiving,1
+DEV_S2014,Chanukah End,1
+DEV_S2014,Christmas,1
+DEV_S2014,NewYear,1
+DEV_S2014,OrthodoxChristmas,1
+DEV_ORD,ValentinesDay,1
+DEV_ORD,PresidentsDay,1
+DEV_ORD,LentStart,1
+DEV_ORD,LentWeek2,1
+DEV_ORD,Purim End,1
+DEV_ORD,StPatricksDay,1
+DEV_ORD,Easter,1
+DEV_ORD,Pesach End,1
+DEV_ORD,OrthodoxEaster,1
+DEV_ORD,Cinco De Mayo,1
+DEV_ORD,Mother's day,1
+DEV_ORD,MemorialDay,1
+DEV_ORD,NBAFinalsStart,1
+DEV_ORD,NBAFinalsEnd,1
+DEV_ORD,Ramadan starts,1
+DEV_ORD,Father's day,1
+DEV_ORD,IndependenceDay,1
+DEV_ORD,Eid al-Fitr,1
+DEV_ORD,LaborDay,1
+DEV_ORD,EidAlAdha,1
+FINAL_TEST,Halloween,1
+FINAL_TEST,VeteransDay,1
+FINAL_TEST,Thanksgiving,1
+FINAL_TEST,Chanukah End,1
+FINAL_TEST,Christmas,1
+FINAL_TEST,NewYear,1
+FINAL_TEST,OrthodoxChristmas,1
+FINAL_TEST,MartinLutherKingDay,1
+FINAL_TEST,SuperBowl,1
+FINAL_TEST,LentStart,1
+FINAL_TEST,ValentinesDay,1
+FINAL_TEST,PresidentsDay,1
+FINAL_TEST,LentWeek2,1
+FINAL_TEST,StPatricksDay,1
+FINAL_TEST,Purim End,1
+FINAL_TEST,Easter,1
+FINAL_TEST,Pesach End,1
+FINAL_TEST,OrthodoxEaster,1
+FINAL_TEST,Cinco De Mayo,1
+FINAL_TEST,Mother's day,1

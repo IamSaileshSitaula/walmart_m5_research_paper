@@ -1,0 +1,101 @@
+[10:30:32] ================================================================================
+[10:30:32] STARTING M5 DIRECT MULTI-HORIZON FORECASTING & EVENT ABLATION EXPERIMENTS
+[10:30:32] ================================================================================
+[10:30:32] Skipping exhaustive pre-training audit as requested.
+[10:30:32] Extracting study population (10% systematic stratified catalog sample)...
+[10:30:32] Study population: 3,050 series (305 items across 10 stores).
+[10:30:32] Comparing candidate objectives on development fold (DEV_S2012)...
+[10:30:35]   Objective: regression_l1   | Best Iter:  61 | Val MAE: 1.1110 | Val RMSE: 2.8637 | Time: 1.6s
+[10:30:37]   Objective: poisson         | Best Iter: 100 | Val MAE: 1.2048 | Val RMSE: 2.7409 | Time: 1.7s
+[10:30:37] Selected objective: 'regression_l1' with lowest validation MAE: 1.1110
+[10:30:37] Running hyperparameter grid search (6 configurations)...
+[10:30:41]   Trial 1/6: lr=0.1, leaves=31, min_leaf=50 -> Val MAE: 1.1105 (best iter 89)
+[10:30:44]   Trial 2/6: lr=0.05, leaves=31, min_leaf=50 -> Val MAE: 1.1111 (best iter 120)
+[10:30:46]   Trial 3/6: lr=0.1, leaves=63, min_leaf=100 -> Val MAE: 1.1112 (best iter 68)
+[10:30:49]   Trial 4/6: lr=0.05, leaves=63, min_leaf=100 -> Val MAE: 1.1101 (best iter 99)
+[10:30:51]   Trial 5/6: lr=0.1, leaves=31, min_leaf=200 -> Val MAE: 1.1124 (best iter 71)
+[10:30:54]   Trial 6/6: lr=0.05, leaves=31, min_leaf=200 -> Val MAE: 1.1176 (best iter 150)
+[10:30:54] Best hyperparameters selected (Val MAE: 1.1101): {'objective': 'regression_l1', 'metric': 'mae', 'verbose': -1, 'n_jobs': 8, 'seed': 42, 'bagging_freq': 1, 'learning_rate': 0.05, 'num_leaves': 63, 'min_data_in_leaf': 100, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'reg_alpha': 0.5, 'reg_lambda': 1.0}
+[10:30:54] Initializing seasonal-naive benchmark with calendar-day lookups...
+[10:31:02] ================================================================================
+[10:31:02] EXECUTING STRICT CHRONOLOGICAL TRAINING AND OUT-OF-SAMPLE EVALUATION BY FOLD
+[10:31:02] ================================================================================
+[10:31:02] ======================================================================
+[10:31:02] PROCESSING FOLD: DEV_S2012 (Role: CHRONOLOGICAL DEVELOPMENT)
+[10:31:02] ======================================================================
+[10:31:02]   Train scope: 9 origins | max target date: 2012-10-14 (d_625)
+[10:31:02]   Eval scope:  10 origins | min target date: 2012-10-26 (d_637)
+[10:31:02]   Temporal separation gap: +12 days (Strictly >= 1 day: True)
+[10:31:02] Training Model DEV_S2012_model_A (7 train origins, 2 val origins)...
+[10:31:05]   Model DEV_S2012_model_A trained in 2.4s | Best Iteration: 83 | Peak RSS: 870.4 MB
+[10:31:05] Training Model DEV_S2012_model_B (7 train origins, 2 val origins)...
+[10:31:07]   Model DEV_S2012_model_B trained in 2.4s | Best Iteration: 90 | Peak RSS: 1021.7 MB
+[10:31:07] Training Model DEV_S2012_model_C (7 train origins, 2 val origins)...
+[10:31:10]   Model DEV_S2012_model_C trained in 3.3s | Best Iteration: 84 | Peak RSS: 1412.7 MB
+[10:31:10] Evaluating 10 origins for fold DEV_S2012 across Benchmark, A, B, and C...
+[10:31:25] ======================================================================
+[10:31:25] PROCESSING FOLD: DEV_S2013 (Role: CHRONOLOGICAL DEVELOPMENT)
+[10:31:25] ======================================================================
+[10:31:25]   Train scope: 30 origins | max target date: 2013-10-13 (d_989)
+[10:31:25]   Eval scope:  10 origins | min target date: 2013-11-01 (d_1008)
+[10:31:25]   Temporal separation gap: +19 days (Strictly >= 1 day: True)
+[10:31:25] Training Model DEV_S2013_model_A (26 train origins, 4 val origins)...
+[10:31:35]   Model DEV_S2013_model_A trained in 10.3s | Best Iteration: 150 | Peak RSS: 2060.1 MB
+[10:31:35] Training Model DEV_S2013_model_B (26 train origins, 4 val origins)...
+[10:31:46]   Model DEV_S2013_model_B trained in 10.7s | Best Iteration: 147 | Peak RSS: 2114.8 MB
+[10:31:46] Training Model DEV_S2013_model_C (26 train origins, 4 val origins)...
+[10:32:00]   Model DEV_S2013_model_C trained in 14.0s | Best Iteration: 147 | Peak RSS: 2463.8 MB
+[10:32:00] Evaluating 10 origins for fold DEV_S2013 across Benchmark, A, B, and C...
+[10:32:17] ======================================================================
+[10:32:17] PROCESSING FOLD: DEV_S2014 (Role: CHRONOLOGICAL DEVELOPMENT)
+[10:32:17] ======================================================================
+[10:32:17]   Train scope: 51 origins | max target date: 2014-10-12 (d_1353)
+[10:32:17]   Eval scope:  10 origins | min target date: 2014-10-31 (d_1372)
+[10:32:17]   Temporal separation gap: +19 days (Strictly >= 1 day: True)
+[10:32:17] Training Model DEV_S2014_model_A (44 train origins, 7 val origins)...
+[10:32:37]   Model DEV_S2014_model_A trained in 19.7s | Best Iteration: 149 | Peak RSS: 2573.6 MB
+[10:32:37] Training Model DEV_S2014_model_B (44 train origins, 7 val origins)...
+[10:32:56]   Model DEV_S2014_model_B trained in 18.9s | Best Iteration: 150 | Peak RSS: 2614.9 MB
+[10:32:56] Training Model DEV_S2014_model_C (44 train origins, 7 val origins)...
+[10:33:20]   Model DEV_S2014_model_C trained in 23.8s | Best Iteration: 120 | Peak RSS: 3311.1 MB
+[10:33:20] Evaluating 10 origins for fold DEV_S2014 across Benchmark, A, B, and C...
+[10:33:39] ======================================================================
+[10:33:39] PROCESSING FOLD: DEV_ORD (Role: CHRONOLOGICAL DEVELOPMENT)
+[10:33:39] ======================================================================
+[10:33:39]   Train scope: 63 origins | max target date: 2015-02-01 (d_1465)
+[10:33:39]   Eval scope:  9 origins | min target date: 2015-02-02 (d_1466)
+[10:33:39]   Temporal separation gap: +1 days (Strictly >= 1 day: True)
+[10:33:39] Training Model DEV_ORD_model_A (54 train origins, 9 val origins)...
+[10:34:04]   Model DEV_ORD_model_A trained in 24.7s | Best Iteration: 150 | Peak RSS: 3061.6 MB
+[10:34:04] Training Model DEV_ORD_model_B (54 train origins, 9 val origins)...
+[10:34:28]   Model DEV_ORD_model_B trained in 24.0s | Best Iteration: 150 | Peak RSS: 3101.6 MB
+[10:34:28] Training Model DEV_ORD_model_C (54 train origins, 9 val origins)...
+[10:35:00]   Model DEV_ORD_model_C trained in 31.8s | Best Iteration: 148 | Peak RSS: 3999.3 MB
+[10:35:00] Evaluating 9 origins for fold DEV_ORD across Benchmark, A, B, and C...
+[10:35:19] ======================================================================
+[10:35:19] PROCESSING FOLD: FINAL_TEST (Role: FROZEN FINAL TEST)
+[10:35:19] ======================================================================
+[10:35:19]   Train scope: 72 origins | max target date: 2015-10-11 (d_1717)
+[10:35:19]   Eval scope:  15 origins | min target date: 2015-10-30 (d_1736)
+[10:35:19]   Temporal separation gap: +19 days (Strictly >= 1 day: True)
+[10:35:19] Training Model FINAL_TEST_model_A (62 train origins, 10 val origins)...
+[10:35:49]   Model FINAL_TEST_model_A trained in 30.5s | Best Iteration: 139 | Peak RSS: 3401.4 MB
+[10:35:50] Training Model FINAL_TEST_model_B (62 train origins, 10 val origins)...
+[10:36:19]   Model FINAL_TEST_model_B trained in 29.1s | Best Iteration: 149 | Peak RSS: 3441.4 MB
+[10:36:19] Training Model FINAL_TEST_model_C (62 train origins, 10 val origins)...
+[10:36:50]   Model FINAL_TEST_model_C trained in 31.4s | Best Iteration: 148 | Peak RSS: 4421.7 MB
+[10:36:50] Evaluating 15 origins for fold FINAL_TEST across Benchmark, A, B, and C...
+[10:37:15] All out-of-sample predictions assembled: 4,192,916 total forecast rows.
+[10:37:15] Generating evaluation tables, fold-provenance audit, and markdown reports...
+[10:37:22] Saved 4,192,916 row-level out-of-sample predictions -> C:\Users\saile\OneDrive\Desktop\research\outputs\m5_models\out_of_sample_predictions.parquet
+[10:37:22] Building fold-provenance and final-test audit table...
+[10:37:38] Conducting dedicated underforecasting bias investigation...
+[10:37:47] Computing holiday episode and fold-level paired comparisons...
+[10:38:42] Fold-provenance audit and evaluation artifacts generated successfully.
+[10:38:42] Executing numerical reproducibility verification check...
+[10:38:42] Reproducibility verification check: max prediction difference = 0.00e+00
+[10:38:42] Reproducibility check: PASS (deterministic rerun within numerical tolerance).
+[10:38:42] ================================================================================
+[10:38:42] ALL EXPERIMENTS AND DELIVERABLES COMPLETED SUCCESSFULLY.
+[10:38:42] Output files stored in: C:\Users\saile\OneDrive\Desktop\research\outputs\m5_models
+[10:38:42] ================================================================================

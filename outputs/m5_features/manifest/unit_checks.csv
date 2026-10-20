@@ -1,0 +1,8 @@
+check_id,requirement,description,n_checked,n_failures,status,notes
+U01,(i) One row per item-store-origin-horizon,"Verify unique primary key (id, origin_id, h) with zero duplicates",470512,0,PASS,"Verified on sample partition O0373 (470,512 rows)"
+U02,(ii) t = O + h and h is 1..28,"Assert target_d == origin_d + h exactly and h in [1, 28]",941024,0,PASS,"Observed h range: [1, 28]; arithmetic violations: 0"
+U03,(iii) Every sales/price source timestamp <= O,Strict temporal barrier: all sales/price inputs dated strictly on or before origin O,88,0,PASS,Verified across all 88 origins; no target-period sales (t > O) accessed
+U04,(iv) Both calendar event slots survive & overlapping events represented,Both event slots preserved in Matrix B; simultaneous events occupy distinct columns in Matrix C,167,0,PASS,5 multi-event days verified with 100% representation
+U05,(v) Final test period did not influence window selection,Event selection and normalization parameters fit strictly on development data (d < 1736),30,0,PASS,Dev cut-off d_1736 enforced; 0 test targets seen during screening
+U06,(vi) All three ablations share identical rows,"Verify identical row counts, series ordering, origin, and horizon across Matrices A, B, and C",1411536,0,PASS,"Identical 470,512 rows and identical coordinates verified across A, B, and C"
+U07,(vii) Results reproducible from fixed cleaned data,Cleaned panel SHA-256 pinned and input loading is deterministic,1,0,PASS,Deterministic pipeline with pinned input hashes and fixed random seed
