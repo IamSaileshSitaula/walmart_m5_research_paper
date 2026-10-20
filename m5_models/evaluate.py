@@ -50,6 +50,96 @@ def compute_metrics(
     }
 
 
+def validate_and_align_coordinates(
+    df_model: pd.DataFrame,
+    coords_ref: pd.DataFrame,
+    model_name: str,
+    orig_id: str,
+) -> pd.DataFrame:
+    """Validate that model input rows match reference coordinates on id, origin_id (where available), h, and target_d.
+    
+    Verifies:
+    - Required keys exist ('id', 'h', 'target_d', and 'origin_id' if available)
+    - Non-null keys
+    - Row counts match exactly
+    - Key uniqueness (no duplicate coordinate keys)
+    - Exact key set match (raises ValueError if keys differ, e.g. incorrect target days or missing SKUs)
+    
+    If rows are reordered (e.g. reordered SKUs or reordered horizons), restores alignment via
+    deterministic join/reindex against coords_ref and verifies position-for-position key equality.
+    """
+    keys = ["id", "h", "target_d"]
+    if "origin_id" in coords_ref.columns:
+        keys.insert(1, "origin_id")
+        
+    for k in keys:
+        if k not in df_model.columns:
+            raise KeyError(
+                f"Coordinate alignment validation failed for {model_name} in origin {orig_id}: "
+                f"Missing required key column '{k}'."
+            )
+            
+    if df_model[keys].isna().any().any():
+        raise ValueError(
+            f"Coordinate alignment validation failed for {model_name} in origin {orig_id}: "
+            f"Null values detected in coordinate keys {keys}."
+        )
+    if coords_ref[keys].isna().any().any():
+        raise ValueError(
+            f"Reference coordinates contain null values in origin {orig_id} for keys {keys}."
+        )
+        
+    if len(df_model) != len(coords_ref):
+        raise ValueError(
+            f"Row count mismatch for {model_name} in origin {orig_id}: "
+            f"model rows = {len(df_model)}, reference rows = {len(coords_ref)}."
+        )
+        
+    if df_model.duplicated(subset=keys).any():
+        raise ValueError(
+            f"Duplicate coordinate keys detected in {model_name} inputs for origin {orig_id}."
+        )
+    if coords_ref.duplicated(subset=keys).any():
+        raise ValueError(
+            f"Duplicate coordinate keys detected in reference coordinates for origin {orig_id}."
+        )
+        
+    # Check if already in exact positional alignment
+    is_aligned = True
+    for k in keys:
+        if not (df_model[k].to_numpy() == coords_ref[k].to_numpy()).all():
+            is_aligned = False
+            break
+            
+    if is_aligned:
+        return df_model
+        
+    # Check if the set of coordinate tuples matches exactly
+    ref_tuples = set(zip(*(coords_ref[k] for k in keys)))
+    model_tuples = set(zip(*(df_model[k] for k in keys)))
+    
+    if ref_tuples != model_tuples:
+        diff_ref = len(ref_tuples - model_tuples)
+        diff_model = len(model_tuples - ref_tuples)
+        raise ValueError(
+            f"Coordinate keys mismatch for {model_name} in origin {orig_id}: "
+            f"{diff_ref} keys in reference not in model, {diff_model} keys in model not in reference. "
+            f"Cannot safely align predictions."
+        )
+        
+    # Restore alignment deterministically via reindexing to match coords_ref exactly
+    df_aligned = coords_ref[keys].merge(df_model, on=keys, how="inner")
+    if len(df_aligned) != len(coords_ref):
+        raise ValueError(
+            f"Alignment restoration produced row count mismatch: {len(df_aligned)} != {len(coords_ref)}"
+        )
+    for k in keys:
+        assert (df_aligned[k].to_numpy() == coords_ref[k].to_numpy()).all(), (
+            f"Post-alignment verification failed on '{k}' for {model_name} in origin {orig_id}."
+        )
+    return df_aligned
+
+
 def predict_evaluation_origins(
     models: Dict[str, Dict],
     benchmark: SeasonalNaiveBenchmark,
@@ -64,8 +154,6 @@ def predict_evaluation_origins(
     """Generate predictions for benchmark, Model A, Model B, Model C, and Model D on eval origins."""
     log(f"Evaluating {len(eval_origs)} origins for fold {fold_id} across Benchmark, A, B, C, and D...")
 
-    
-    # We will load origin by origin to keep memory light (< 100 MB per origin)
     all_preds_list = []
     
     # Event mapping to tag events
@@ -96,6 +184,15 @@ def predict_evaluation_origins(
                        "sales_last_O", "sales_zero_ratio_28d", "sales_mean_28d"]].copy()
         coords["fold_id"] = fold_id
         
+        # Verify reference coordinates integrity
+        ref_keys = ["id", "h", "target_d"]
+        if "origin_id" in coords.columns:
+            ref_keys.insert(1, "origin_id")
+        if coords[ref_keys].isna().any().any():
+            raise ValueError(f"Reference coordinates in origin {orig_id} contain null keys!")
+        if coords.duplicated(subset=ref_keys).any():
+            raise ValueError(f"Reference coordinates in origin {orig_id} contain duplicate keys!")
+        
         # 2. Benchmark prediction
         bench_preds, bench_avail = benchmark.predict(coords)
         coords["pred_bench"] = bench_preds
@@ -116,6 +213,12 @@ def predict_evaluation_origins(
         tbl_B = pq.ParquetFile(p_B).read()
         df_B = tbl_B.to_pandas()
         df_B = df_B[df_B["id"].isin(sampled_ids)].reset_index(drop=True)
+        if "origin_id" not in df_B.columns and "origin_id" in coords.columns:
+            df_B["origin_id"] = orig_id
+            
+        # Validate and align df_B against reference coordinates before predicting
+        df_B = validate_and_align_coordinates(df_B, coords, model_name="Model B", orig_id=orig_id)
+        
         if fold_cat_medians is not None and "last_price_known_at_origin" in df_B.columns and "cat_id" in df_B.columns:
             denom = df_B["cat_id"].map(fold_cat_medians).astype(float)
             df_B["price_ratio_to_cat_median"] = np.where(
@@ -140,15 +243,20 @@ def predict_evaluation_origins(
         if fold_day_C is not None:
             day_C_indexed = fold_day_C.set_index("d_num")
             c_cols = [c for c in fold_day_C.columns if c != "d_num"]
+            missing_days = set(df_B["target_d"]) - set(day_C_indexed.index)
+            if missing_days:
+                raise KeyError(f"Target days {missing_days} not found in fold_day_C for origin {orig_id}")
             df_C_feats = day_C_indexed[c_cols].loc[df_B["target_d"]].reset_index(drop=True)
             b_event_cols = {"t_event_name_1", "t_event_type_1", "t_event_name_2", "t_event_type_2"}
             base_cols_C = [c for c in df_B.columns if c not in b_event_cols]
-            df_C = pd.concat([df_B[base_cols_C], df_C_feats], axis=1)
+            df_C = pd.concat([df_B[base_cols_C].reset_index(drop=True), df_C_feats], axis=1)
         else:
             p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
             tbl_C = pq.ParquetFile(p_C).read()
             df_C = tbl_C.to_pandas()
             df_C = df_C[df_C["id"].isin(sampled_ids)].reset_index(drop=True)
+            if "origin_id" not in df_C.columns and "origin_id" in coords.columns:
+                df_C["origin_id"] = orig_id
             if fold_cat_medians is not None and "last_price_known_at_origin" in df_C.columns and "cat_id" in df_C.columns:
                 denom = df_C["cat_id"].map(fold_cat_medians).astype(float)
                 df_C["price_ratio_to_cat_median"] = np.where(
@@ -156,6 +264,9 @@ def predict_evaluation_origins(
                     df_C["last_price_known_at_origin"] / denom,
                     np.nan
                 ).astype(np.float32)
+                
+        # Validate and align df_C against reference coordinates before predicting
+        df_C = validate_and_align_coordinates(df_C, coords, model_name="Model C", orig_id=orig_id)
             
         for c in df_C.columns:
             if c.startswith("ph_"):
@@ -180,6 +291,9 @@ def predict_evaluation_origins(
             if fold_day_C is not None:
                 day_C_indexed = fold_day_C.set_index("d_num")
                 c_extra = [c for c in fold_day_C.columns if c.startswith("ph_") or c.startswith("k_") or c.startswith("n_fam_") or c.startswith("span_")]
+                missing_days = set(df_B["target_d"]) - set(day_C_indexed.index)
+                if missing_days:
+                    raise KeyError(f"Target days {missing_days} not found in fold_day_C for origin {orig_id}")
                 df_C_extra = day_C_indexed[c_extra].loc[df_B["target_d"]].reset_index(drop=True)
             else:
                 for coord in ["id", "h", "target_d"]:
@@ -193,7 +307,11 @@ def predict_evaluation_origins(
             assert len(df_B) == len(df_C_extra), (
                 f"Row mismatch between B ({len(df_B)}) and C extra ({len(df_C_extra)}) in origin {orig_id}"
             )
-            df_D = pd.concat([df_B, df_C_extra], axis=1)
+            df_D = pd.concat([df_B.reset_index(drop=True), df_C_extra], axis=1)
+            
+            # Validate and align df_D against reference coordinates before predicting
+            df_D = validate_and_align_coordinates(df_D, coords, model_name="Model D", orig_id=orig_id)
+            
             for c in df_D.columns:
                 if c.startswith("ph_"):
                     df_D[c] = pd.Categorical(df_D[c], categories=PHASE_CATEGORIES)

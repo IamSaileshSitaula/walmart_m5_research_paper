@@ -24,8 +24,10 @@ from m5_models.data import (
     compute_fold_category_median_prices,
     load_partition_subset,
 )
+from m5_models.evaluate import predict_evaluation_origins
 from m5_models.sku_attention import (
     evaluate_sku_attention_rule,
+    generate_population_eligibility_audit,
     get_holiday_relevant_origins,
     is_holiday_relevant_origin,
     verify_horizon_integrity,
@@ -589,6 +591,289 @@ class TestChronologicalIntegrity(unittest.TestCase):
             actual_ratios = df_val_loaded["price_ratio_to_cat_median"].to_numpy()
             np.testing.assert_allclose(actual_ratios, expected_ratios, rtol=1e-5)
 
+    def test_exact_horizon_validation_rejection_of_floats_and_nulls(self):
+        """Test 9: Exact horizon validation strictly requires integer membership in {1, ..., 28},
+        non-null coordinate keys, and rejection of float values like 14.5.
+        """
+        # Baseline valid dataframe with 28 horizons
+        records = []
+        for h in range(1, 29):
+            records.append({"id": "s1", "origin_id": "O1000", "h": h})
+        df_valid = pd.DataFrame(records)
+        
+        # Valid should pass without exception
+        verify_horizon_integrity(df_valid, context_name="test_valid")
+        
+        # Case 1: Float 14.5 replaces integer 14 (count is 28, min is 1, max is 28)
+        df_float = df_valid.astype({"h": float})
+        df_float.loc[df_float["h"] == 14.0, "h"] = 14.5
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_float, context_name="test_float")
+        self.assertIn("Non-integer horizon values", str(ctx.exception))
+        
+        # Case 2: Null key in 'h'
+        df_null_h = df_valid.copy()
+        df_null_h.loc[0, "h"] = np.nan
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_null_h, context_name="test_null_h")
+        self.assertIn("Null values detected", str(ctx.exception))
+        
+        # Case 3: Null key in 'id'
+        df_null_id = df_valid.copy()
+        df_null_id.loc[0, "id"] = None
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_null_id, context_name="test_null_id")
+        self.assertIn("Null values detected", str(ctx.exception))
+        
+        # Case 4: Missing required column
+        df_missing_col = df_valid.drop(columns=["origin_id"])
+        with self.assertRaises(KeyError) as ctx:
+            verify_horizon_integrity(df_missing_col, context_name="test_missing_col")
+        self.assertIn("Missing required column 'origin_id'", str(ctx.exception))
+        
+        # Case 5: Horizon outside {1, ..., 28} (e.g. 29 replacing 14)
+        df_out_of_range = df_valid.copy()
+        df_out_of_range.loc[df_out_of_range["h"] == 14, "h"] = 29
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_out_of_range, context_name="test_out_of_range")
+        self.assertIn("Horizons outside valid set", str(ctx.exception))
+
+        # Case 6: Duplicate horizon (15 duplicated, 14 missing)
+        df_dup = df_valid.copy()
+        df_dup.loc[df_dup["h"] == 14, "h"] = 15
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_dup, context_name="test_dup")
+        self.assertIn("Duplicate", str(ctx.exception))
+
+    def test_evaluator_coordinate_alignment_with_fold_day_c(self):
+        """Test 10: Calling the actual predict_evaluation_origins evaluator with fold_day_C supplied
+        across 5 conditions:
+        1. Correctly aligned inputs
+        2. Reordered SKU rows (evaluator restores alignment; never misassigns forecasts)
+        3. Reordered horizons within one SKU (evaluator restores alignment)
+        4. Incorrect target days (raises clear error)
+        5. Missing or duplicate keys (raises clear error)
+        """
+        class MockBooster:
+            def predict(self, df):
+                return df["f1"].to_numpy(dtype=np.float64)
+
+        class MockBenchmark:
+            def predict(self, coords):
+                n = len(coords)
+                return np.zeros(n, dtype=np.float64), np.ones(n, dtype=bool)
+
+        orig_id = "O1000"
+        orig_d = 1000
+        target_days = list(range(orig_d + 1, orig_d + 29))  # 1001..1028
+        
+        fold_day_C = pd.DataFrame({
+            "d_num": target_days,
+            "c_feat": [1.0] * 28,
+            "ph_thanksgiving": ["NONE"] * 28,
+            "k_thanksgiving": [999] * 28,
+        })
+        
+        models = {
+            "model_A": {"booster": MockBooster(), "feature_cols": ["f1"], "cat_cols": []},
+            "model_B": {"booster": MockBooster(), "feature_cols": ["f1"], "cat_cols": []},
+            "model_C": {"booster": MockBooster(), "feature_cols": ["f1", "k_thanksgiving"], "cat_cols": []},
+            "model_D": {"booster": MockBooster(), "feature_cols": ["f1", "k_thanksgiving"], "cat_cols": []},
+        }
+        sampled_ids = {"SKU_1", "SKU_2"}
+        
+        def build_matrix_A_df():
+            rows = []
+            for s_id, base_val in [("SKU_1", 100.0), ("SKU_2", 200.0)]:
+                for h in range(1, 29):
+                    rows.append({
+                        "id": s_id, "item_id": s_id, "dept_id": "D1", "cat_id": "C1",
+                        "store_id": "ST1", "state_id": "CA",
+                        "origin_id": orig_id, "origin_d": orig_d, "h": h,
+                        "target_d": orig_d + h, "target_date": f"2013-10-{h:02d}",
+                        "target_units_sold": 5.0, "sales_last_O": 5.0,
+                        "sales_zero_ratio_28d": 0.0, "sales_mean_28d": 5.0,
+                        "f1": base_val + float(h),
+                    })
+            return pd.DataFrame(rows)
+
+        def build_matrix_B_df():
+            rows = []
+            for s_id, base_val in [("SKU_1", 100.0), ("SKU_2", 200.0)]:
+                for h in range(1, 29):
+                    rows.append({
+                        "id": s_id, "item_id": s_id, "dept_id": "D1", "cat_id": "C1",
+                        "store_id": "ST1", "state_id": "CA",
+                        "origin_id": orig_id, "origin_d": orig_d, "h": h,
+                        "target_d": orig_d + h, "target_date": f"2013-10-{h:02d}",
+                        "t_event_name_1": "None", "t_no_event": 1,
+                        "f1": base_val + float(h),
+                    })
+            return pd.DataFrame(rows)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mat_A = tmp_path / "matrix_A"
+            mat_B = tmp_path / "matrix_B"
+            (mat_A / f"origin_id={orig_id}").mkdir(parents=True)
+            (mat_B / f"origin_id={orig_id}").mkdir(parents=True)
+            
+            df_A = build_matrix_A_df()
+            pq.write_table(pa.Table.from_pandas(df_A), mat_A / f"origin_id={orig_id}" / "data.parquet")
+            
+            cfg = ModelConfig(
+                matrix_A_dir=mat_A,
+                matrix_B_dir=mat_B,
+                features_dir=tmp_path,
+                clip_nonnegative=True,
+            )
+            
+            # --- Condition 1: Correctly aligned inputs ---
+            df_B_aligned = build_matrix_B_df()
+            pq.write_table(pa.Table.from_pandas(df_B_aligned), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            res1 = predict_evaluation_origins(
+                models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                fold_day_C=fold_day_C, log=lambda m: None,
+            )
+            self.assertEqual(len(res1), 56)
+            s1_preds = res1[res1["id"] == "SKU_1"].sort_values("h")
+            s2_preds = res1[res1["id"] == "SKU_2"].sort_values("h")
+            np.testing.assert_array_equal(s1_preds["pred_B"].to_numpy(), 100.0 + np.arange(1, 29))
+            np.testing.assert_array_equal(s2_preds["pred_B"].to_numpy(), 200.0 + np.arange(1, 29))
+            np.testing.assert_array_equal(s1_preds["pred_C"].to_numpy(), 100.0 + np.arange(1, 29))
+            np.testing.assert_array_equal(s1_preds["pred_D"].to_numpy(), 100.0 + np.arange(1, 29))
+
+            # --- Condition 2: Reordered SKU rows in Matrix B ---
+            # Matrix B has SKU_2 first, then SKU_1 (reversed SKU order)
+            df_B_reordered_skus = pd.concat([
+                df_B_aligned[df_B_aligned["id"] == "SKU_2"],
+                df_B_aligned[df_B_aligned["id"] == "SKU_1"],
+            ], ignore_index=True)
+            pq.write_table(pa.Table.from_pandas(df_B_reordered_skus), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            
+            res2 = predict_evaluation_origins(
+                models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                fold_day_C=fold_day_C, log=lambda m: None,
+            )
+            self.assertEqual(len(res2), 56)
+            # Crucial assertion: Evaluator MUST restore alignment to reference coordinates (df_A order: SKU_1 first, then SKU_2)
+            self.assertEqual(list(res2["id"][:28]), ["SKU_1"] * 28)
+            self.assertEqual(list(res2["id"][28:]), ["SKU_2"] * 28)
+            # And predictions must NEVER be misassigned to the wrong SKU!
+            s1_preds2 = res2[res2["id"] == "SKU_1"].sort_values("h")
+            s2_preds2 = res2[res2["id"] == "SKU_2"].sort_values("h")
+            np.testing.assert_array_equal(s1_preds2["pred_B"].to_numpy(), 100.0 + np.arange(1, 29))
+            np.testing.assert_array_equal(s2_preds2["pred_B"].to_numpy(), 200.0 + np.arange(1, 29))
+
+            # --- Condition 3: Reordered horizons within one SKU in Matrix B ---
+            # Reverse horizons for SKU_1
+            df_B_reordered_h = pd.concat([
+                df_B_aligned[df_B_aligned["id"] == "SKU_1"].iloc[::-1],
+                df_B_aligned[df_B_aligned["id"] == "SKU_2"],
+            ], ignore_index=True)
+            pq.write_table(pa.Table.from_pandas(df_B_reordered_h), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            
+            res3 = predict_evaluation_origins(
+                models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                fold_day_C=fold_day_C, log=lambda m: None,
+            )
+            self.assertEqual(len(res3), 56)
+            s1_preds3 = res3[res3["id"] == "SKU_1"].sort_values("h")
+            np.testing.assert_array_equal(s1_preds3["pred_B"].to_numpy(), 100.0 + np.arange(1, 29))
+
+            # --- Condition 4: Incorrect target days in Matrix B ---
+            df_B_bad_target = df_B_aligned.copy()
+            df_B_bad_target.loc[0, "target_d"] = 9999
+            pq.write_table(pa.Table.from_pandas(df_B_bad_target), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            with self.assertRaises(ValueError) as ctx:
+                predict_evaluation_origins(
+                    models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                    fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                    fold_day_C=fold_day_C, log=lambda m: None,
+                )
+            self.assertIn("Coordinate keys mismatch", str(ctx.exception))
+
+            # --- Condition 5a: Missing required key in Matrix B ---
+            df_B_missing_key = df_B_aligned.drop(columns=["h"])
+            pq.write_table(pa.Table.from_pandas(df_B_missing_key), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            with self.assertRaises(KeyError) as ctx:
+                predict_evaluation_origins(
+                    models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                    fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                    fold_day_C=fold_day_C, log=lambda m: None,
+                )
+            self.assertIn("Missing required key column 'h'", str(ctx.exception))
+
+            # --- Condition 5b: Duplicate keys in Matrix B ---
+            df_B_dup_key = pd.concat([df_B_aligned.iloc[[0]], df_B_aligned], ignore_index=True)
+            pq.write_table(pa.Table.from_pandas(df_B_dup_key), mat_B / f"origin_id={orig_id}" / "data.parquet")
+            with self.assertRaises(ValueError) as ctx:
+                predict_evaluation_origins(
+                    models=models, benchmark=MockBenchmark(), eval_origs=[orig_id],
+                    fold_id="DEV_S2013", sampled_ids=sampled_ids, cfg=cfg,
+                    fold_day_C=fold_day_C, log=lambda m: None,
+                )
+            self.assertTrue("Duplicate coordinate keys detected" in str(ctx.exception) or "Row count mismatch" in str(ctx.exception))
+
+    def test_population_eligibility_audit_synthetic(self):
+        """Test 11: Population eligibility audit correctly calculates first observed positive sales,
+        checks 28-day minimum history (first_sale_d <= origin_d - 27) against dev and test holiday origins,
+        and derives audit reasons accurately.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            panel_p = tmp_path / "panel.parquet"
+            
+            # Create synthetic panel with _evaluation suffix
+            panel_data = pd.DataFrame({
+                "id": ["s_unranked_evaluation", "s_inactive_evaluation"],
+                "d_num": [1410, 1798],
+                "date": ["2014-12-08", "2015-12-31"],
+                "units_sold": [5.0, 3.0],
+            })
+            pq.write_table(pa.Table.from_pandas(panel_data), panel_p)
+            
+            # Synthetic origins metadata
+            dev_hol_origs = ["O1420"]
+            test_hol_origs = ["O1735", "O1785"]
+            full_preds_df = pd.DataFrame({
+                "origin_id": ["O1420", "O1735", "O1785"],
+                "origin_d": [1420, 1735, 1785],
+                "fold_id": ["DEV_S2014", "FINAL_TEST", "FINAL_TEST"],
+            })
+            
+            audit_df = generate_population_eligibility_audit(
+                full_preds_df=full_preds_df,
+                dev_hol_origs=dev_hol_origs,
+                test_hol_origs=test_hol_origs,
+                g3_ids={"s_unranked"},
+                inact_ids={"s_inactive"},
+                out_dir=tmp_path,
+                panel_path=panel_p,
+                log=lambda m: None,
+            )
+            
+            self.assertEqual(len(audit_df), 2)
+            unranked_row = audit_df[audit_df["id"] == "s_unranked"].iloc[0]
+            self.assertEqual(unranked_row["population_group"], "UNRANKED_ACTIVE_2015")
+            self.assertEqual(unranked_row["first_positive_sale_d"], 1410)
+            self.assertEqual(unranked_row["dev_holiday_origins_satisfied"], 0)
+            self.assertFalse(unranked_row["satisfied_dev_min_history"])
+            self.assertEqual(unranked_row["test_holiday_origins_satisfied"], 2)  # 1735 - 27 = 1708 >= 1410 and 1785 - 27 = 1758 >= 1410
+            self.assertTrue(unranked_row["satisfied_test_min_history"])
+            self.assertIn("No eligible development forecast origins under the 28-day minimum-history rule", unranked_row["eligibility_reason"])
+
+            inactive_row = audit_df[audit_df["id"] == "s_inactive"].iloc[0]
+            self.assertEqual(inactive_row["population_group"], "INACTIVE_2015_HOLIDAY")
+            self.assertEqual(inactive_row["first_positive_sale_d"], 1798)
+            self.assertEqual(inactive_row["test_holiday_origins_satisfied"], 0)
+            self.assertFalse(inactive_row["satisfied_test_min_history"])
+            self.assertIn("Zero sales observed prior to 2015 holiday forecast origins", inactive_row["eligibility_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

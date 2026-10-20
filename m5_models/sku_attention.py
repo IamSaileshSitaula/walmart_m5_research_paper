@@ -68,37 +68,175 @@ def get_holiday_relevant_origins(
     return hol_origs
 
 
+REQUIRED_HORIZONS: Set[int] = set(range(1, 29))
+
+
 def verify_horizon_integrity(df: pd.DataFrame, context_name: str = "predictions") -> None:
     """Verify that each eligible (id, origin_id) pair contains each horizon 1..28 exactly once.
     
-    A duplicate horizon or a missing horizon must fail.
+    Explicitly requires:
+    - Non-null keys ('id', 'origin_id', 'h')
+    - Integer horizon values strictly in {1, ..., 28}
+    - Exactly 28 horizons per pair with no duplicates and no missing horizons.
+    Non-integer values (e.g. 14.5), duplicate horizons, or missing horizons must fail with ValueError.
     """
+    for col in ["id", "origin_id", "h"]:
+        if col not in df.columns:
+            raise KeyError(f"Missing required column '{col}' in {context_name}")
+        if df[col].isna().any():
+            n_null = int(df[col].isna().sum())
+            raise ValueError(f"Null values detected in column '{col}' ({n_null} nulls) in {context_name}")
+
+    h_series = df["h"]
+    # Check if any float values with non-zero fractional part exist (e.g. 14.5)
+    if not np.all(np.equal(np.mod(h_series, 1), 0)):
+        invalid_floats = df[np.mod(df["h"], 1) != 0]["h"].head().tolist()
+        raise ValueError(
+            f"Horizon integrity failed in {context_name}: Non-integer horizon values detected! Examples: {invalid_floats}"
+        )
+
+    h_int = h_series.astype(int)
+    invalid_range = df[~h_int.isin(REQUIRED_HORIZONS)]["h"].head().tolist()
+    if invalid_range:
+        raise ValueError(
+            f"Horizon integrity failed in {context_name}: Horizons outside valid set {{1..28}} detected! Examples: {invalid_range}"
+        )
+
     if df.duplicated(subset=["id", "origin_id", "h"]).any():
         dups = df[df.duplicated(subset=["id", "origin_id", "h"], keep=False)]
         example_dup = dups[["id", "origin_id", "h"]].head()
         raise ValueError(
-            f"Horizon integrity failed in {context_name}: Duplicate (id, origin_id, h) detected! "
-            f"Examples:\n{example_dup}"
+            f"Horizon integrity failed in {context_name}: Duplicate (id, origin_id, h) detected! Examples:\n{example_dup}"
         )
-    
-    h_stats = df.groupby(["id", "origin_id"], observed=True)["h"].agg(["count", "nunique", "min", "max"])
-    incomplete = h_stats[
-        (h_stats["count"] != 28) |
-        (h_stats["nunique"] != 28) |
-        (h_stats["min"] != 1) |
-        (h_stats["max"] != 28)
-    ]
+
+    pair_counts = df.groupby(["id", "origin_id"], observed=True).size()
+    incomplete = pair_counts[pair_counts != 28]
     if len(incomplete) > 0:
         raise ValueError(
-            f"Horizon integrity failed in {context_name}: {len(incomplete)} (id, origin_id) pairs "
-            f"do not contain each horizon 1..28 exactly once! Examples:\n{incomplete.head()}"
+            f"Horizon integrity failed in {context_name}: {len(incomplete)} pairs do not contain exactly 28 horizons! "
+            f"Examples:\n{incomplete.head()}"
         )
+
+
+def generate_population_eligibility_audit(
+    full_preds_df: pd.DataFrame,
+    dev_hol_origs: List[str],
+    test_hol_origs: List[str],
+    g3_ids: Set[str],
+    inact_ids: Set[str],
+    out_dir: Path,
+    panel_path: Optional[Path] = None,
+    log: callable = print,
+) -> pd.DataFrame:
+    """Generate population-eligibility audit for unranked active and inactive series.
+    
+    Derives actual first positive sale day and date from the cleaned daily panel,
+    handling the '_evaluation' suffix.
+    Evaluates satisfaction of the 28-day minimum-history rule (first_sale_d <= origin_d - 27)
+    against development and 2015 test holiday origins.
+    """
+    if panel_path is None:
+        panel_path = Path("outputs/m5_cleaning/panel/m5_daily_item_store_clean.parquet")
+        
+    affected_ids = sorted(list(g3_ids | inact_ids))
+    if len(affected_ids) == 0:
+        return pd.DataFrame()
+    if not panel_path.exists():
+        log(f"  Warning: Panel path {panel_path} not found. Skipping panel-derived eligibility audit.")
+        return pd.DataFrame()
+        
+    import pyarrow.parquet as pq
+    target_panel_ids = {f"{mid}_evaluation" for mid in affected_ids}
+    tbl = pq.read_table(
+        panel_path,
+        columns=["id", "d_num", "date", "units_sold"],
+        filters=[("id", "in", list(target_panel_ids))]
+    )
+    df_panel = tbl.to_pandas()
+    df_panel["model_id"] = df_panel["id"].str.replace("_evaluation", "")
+    
+    pos_sales = df_panel[df_panel["units_sold"] > 0]
+    first_sales = pos_sales.groupby("model_id").agg(
+        first_positive_sale_d=("d_num", "min"),
+        first_positive_sale_date=("date", "min")
+    ).reset_index()
+    first_sales_dict = first_sales.set_index("model_id").to_dict(orient="index")
+    
+    origins_meta = full_preds_df[["origin_id", "origin_d", "fold_id"]].drop_duplicates()
+    dev_hol = origins_meta[origins_meta["origin_id"].isin(dev_hol_origs)].sort_values("origin_d")
+    test_hol = origins_meta[origins_meta["origin_id"].isin(test_hol_origs)].sort_values("origin_d")
+    
+    min_dev_orig_d = int(dev_hol["origin_d"].min()) if len(dev_hol) > 0 else 636
+    max_dev_orig_d = int(dev_hol["origin_d"].max()) if len(dev_hol) > 0 else 1420
+    last_dev_orig_id = str(dev_hol.iloc[-1]["origin_id"]) if len(dev_hol) > 0 else "O1420"
+    min_test_orig_d = int(test_hol["origin_d"].min()) if len(test_hol) > 0 else 1735
+    max_test_orig_d = int(test_hol["origin_d"].max()) if len(test_hol) > 0 else 1785
+    
+    audit_records = []
+    for s_id in affected_ids:
+        group = "UNRANKED_ACTIVE_2015" if s_id in g3_ids else "INACTIVE_2015_HOLIDAY"
+        
+        if s_id in first_sales_dict:
+            f_d = int(first_sales_dict[s_id]["first_positive_sale_d"])
+            f_date = str(first_sales_dict[s_id]["first_positive_sale_date"])
+            
+            # In builder.py line 151: first_sale_idx <= O_d - 28.
+            # Since first_sale_d is 1-indexed (first_sale_d = first_sale_idx + 1),
+            # minimum-history condition is first_sale_d <= O_d - 27.
+            dev_active_origs = dev_hol[dev_hol["origin_d"] - 27 >= f_d]["origin_id"].tolist()
+            test_active_origs = test_hol[test_hol["origin_d"] - 27 >= f_d]["origin_id"].tolist()
+            
+            sat_dev = len(dev_active_origs) > 0
+            sat_test = len(test_active_origs) > 0
+            
+            if group == "UNRANKED_ACTIVE_2015":
+                reason = (
+                    f"First positive sale on day {f_d} ({f_date}) is after latest development holiday cutoff "
+                    f"(d={max_dev_orig_d - 27}, origin {last_dev_orig_id}). "
+                    f"No eligible development forecast origins under the 28-day minimum-history rule. "
+                    f"Satisfied minimum history for {len(test_active_origs)}/10 2015 test holiday origins."
+                )
+            else:
+                reason = (
+                    f"First positive sale on day {f_d} ({f_date}) occurred after all 10 2015 test holiday origins "
+                    f"(range d={min_test_orig_d}..{max_test_orig_d}). "
+                    f"Zero sales observed prior to 2015 holiday forecast origins."
+                )
+        else:
+            f_d = None
+            f_date = None
+            sat_dev = False
+            sat_test = False
+            dev_active_origs = []
+            test_active_origs = []
+            reason = "No positive sales observed in cleaned panel; eligibility reason cannot be established from panel data."
+            
+        audit_records.append({
+            "id": s_id,
+            "population_group": group,
+            "first_positive_sale_d": f_d,
+            "first_positive_sale_date": f_date,
+            "sampled_dev_holiday_origins": f"{len(dev_hol)} origins (d={min_dev_orig_d}..{max_dev_orig_d})",
+            "dev_holiday_origins_satisfied": len(dev_active_origs),
+            "satisfied_dev_min_history": sat_dev,
+            "sampled_test_holiday_origins": f"{len(test_hol)} origins (d={min_test_orig_d}..{max_test_orig_d})",
+            "test_holiday_origins_satisfied": len(test_active_origs),
+            "satisfied_test_min_history": sat_test,
+            "eligibility_reason": reason,
+        })
+        
+    df_audit = pd.DataFrame(audit_records).sort_values(["population_group", "first_positive_sale_d", "id"]).reset_index(drop=True)
+    audit_csv = out_dir / "population_eligibility_audit.csv"
+    df_audit.to_csv(audit_csv, index=False)
+    log(f"  Population eligibility audit saved -> {audit_csv} ({len(df_audit)} affected series)")
+    return df_audit
 
 
 def evaluate_sku_attention_rule(
     full_preds_df: pd.DataFrame,
     out_dir: Path,
     top_k: int = 50,
+    panel_path: Optional[Path] = None,
     log: callable = print,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     """Calibrate SKU attention ranking strictly on development holiday origins and evaluate on 2015.
@@ -229,6 +367,18 @@ def evaluate_sku_attention_rule(
     log(f"    - Group 3 (2015-active unranked late introductions): {len(g3_ids):,} series")
     log(f"    -> Total 2015-Active Holiday Series: {n_test_active:,} series")
     log(f"    - Sampled Series Without 2015 Holiday Evaluation: {n_test_inactive:,} series")
+    
+    # Population eligibility audit for affected series (Group 3 and inactive series)
+    audit_df = generate_population_eligibility_audit(
+        full_preds_df=full_preds_df,
+        dev_hol_origs=dev_hol_origs,
+        test_hol_origs=test_hol_origs,
+        g3_ids=g3_ids,
+        inact_ids=inactive_study_ids,
+        out_dir=out_dir,
+        panel_path=panel_path,
+        log=log,
+    )
     
     # -------------------------------------------------------------------------
     # 6. Group Metrics and Row Count Verification
@@ -508,6 +658,49 @@ def evaluate_sku_attention_rule(
     # -------------------------------------------------------------------------
     # 11. Generate Markdown Report
     # -------------------------------------------------------------------------
+    # Format data-derived population descriptions dynamically from audit
+    g3_audit = audit_df[audit_df["population_group"] == "UNRANKED_ACTIVE_2015"] if len(audit_df) > 0 else pd.DataFrame()
+    inact_audit = audit_df[audit_df["population_group"] == "INACTIVE_2015_HOLIDAY"] if len(audit_df) > 0 else pd.DataFrame()
+
+    if len(g3_audit) > 0 and g3_audit["first_positive_sale_d"].notna().any():
+        g3_valid = g3_audit[g3_audit["first_positive_sale_d"].notna()]
+        g3_min_d = int(g3_valid["first_positive_sale_d"].min())
+        g3_max_d = int(g3_valid["first_positive_sale_d"].max())
+        g3_min_date = str(g3_valid.loc[g3_valid["first_positive_sale_d"] == g3_min_d, "first_positive_sale_date"].iloc[0])
+        g3_max_date = str(g3_valid.loc[g3_valid["first_positive_sale_d"] == g3_max_d, "first_positive_sale_date"].iloc[0])
+        g3_sat_dev = int(g3_valid["satisfied_dev_min_history"].sum())
+        g3_min_test_sat = int(g3_valid["test_holiday_origins_satisfied"].min())
+        g3_max_test_sat = int(g3_valid["test_holiday_origins_satisfied"].max())
+        g3_desc = (
+            f"Series active in the 2015 holiday evaluation whose first observed positive sales range from day {g3_min_d} ({g3_min_date}) to day {g3_max_d} ({g3_max_date}). "
+            f"Although some of these series had sales during late 2014, none ({g3_sat_dev}/{len(g3_valid)}) satisfied the 28-day minimum-history requirement (`first_sale_d <= origin_d - 27`) at any of the {len(dev_hol_origs)} sampled development holiday forecast origins "
+            f"(the latest development holiday origin O1420 at d=1420 required first observed positive sale on or before d=1393). "
+            f"Because they had no eligible development forecast origins under the minimum-history rule, they received no development attention score. "
+            f"All {len(g3_valid)} series satisfied the minimum-history rule for between {g3_min_test_sat} and {g3_max_test_sat} of the {len(test_hol_origs)} sampled 2015 test holiday origins (range d=1735..1785). "
+            f"Their prospective policy assignment for subsequent inventory simulation is the baseline Model B default."
+        )
+    else:
+        g3_desc = (
+            "Series active in the 2015 holiday evaluation with no eligible development forecast origins under the 28-day minimum-history rule. "
+            "Their prospective policy assignment for subsequent inventory simulation is the baseline Model B default."
+        )
+
+    if len(inact_audit) > 0 and inact_audit["first_positive_sale_d"].notna().any():
+        inact_records = inact_audit[inact_audit["first_positive_sale_d"].notna()].sort_values("first_positive_sale_d")
+        details = [f"`{r.id}` (day {int(r.first_positive_sale_d)}, {r.first_positive_sale_date})" for r in inact_records.itertuples()]
+        details_str = ", ".join(details)
+        inact_desc = (
+            f"These series' first observed positive sales occurred at days {details_str}. "
+            f"Because all 10 sampled 2015 test holiday forecast origins precede day 1786 ($O_d \\le 1785$), "
+            f"none of these four series had any observed positive sales prior to the 2015 holiday forecast origins, "
+            f"failing the active-series minimum-history rule for all 2015 holiday evaluation origins."
+        )
+    else:
+        inact_desc = (
+            "Sampled series with no observed sales prior to the 2015 holiday forecast origins, "
+            "failing the active-series eligibility rule for all 2015 holiday evaluation origins."
+        )
+
     md_lines = [
         "# SKU Attention Rule: Development Calibration & 2015 Exploratory Evaluation",
         "",
@@ -532,9 +725,9 @@ def evaluate_sku_attention_rule(
         "- **Mutually Exclusive & Exhaustive Population Accounting**:",
         f"  - **Group 1: Top-{top_k} Development-Ranked Series (Flagged for Review)**: **{m_g1['n_series']:,} series** ({m_g1['n_rows']:,} forecast rows). Calibrated strictly on historical 2012–2014 development holiday episodes.",
         f"  - **Group 2: Other Development-Ranked Series (Unflagged)**: **{m_g2['n_series']:,} series** ({m_g2['n_rows']:,} forecast rows). Active during 2012–2014 development episodes, ranked outside the top {top_k}.",
-        f"  - **Group 3: 2015-Active Series Without Dev Score (Model B Default)**: **{m_g3['n_series']:,} series** ({m_g3['n_rows']:,} forecast rows). Series active in the 2015 holiday evaluation whose first positive sale occurred after the development holiday cutoff (late catalog introductions between late 2014 and 2015). Because they have zero development holiday history, they are not eligible for historical ranking. Their prospective policy assignment for subsequent inventory simulation is the baseline Model B default.",
+        f"  - **Group 3: 2015-Active Series Without Dev Score (Model B Default)**: **{m_g3['n_series']:,} series** ({m_g3['n_rows']:,} forecast rows). {g3_desc}",
         f"  - **Total 2015-Active Holiday Series**: **{m_all['n_series']:,} series** ({m_all['n_rows']:,} forecast rows; sum of Groups 1 + 2 + 3).",
-        f"  - **Sampled Series Without 2015 Holiday Evaluation (Inactive/Unobserved)**: **{n_test_inactive:,} series** (0 holiday rows). Introduced in 2016 (first positive sale at day 1829 or later), so they had not yet had active sales during late-2015 holiday origins.",
+        f"  - **Sampled Series Without 2015 Holiday Evaluation (Inactive/Unobserved)**: **{n_test_inactive:,} series** (0 holiday rows). {inact_desc}",
         f"  - **Total Study Population**: **{n_study_series:,} series** ({n_test_active:,} active + {n_test_inactive:,} inactive = {n_study_series:,}).",
         "",
         "## 2. 2015 Exploratory Performance: Mutually Exclusive Population Accounting",
