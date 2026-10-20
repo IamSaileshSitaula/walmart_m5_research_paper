@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 from .audit import run_pre_training_audit
 from .benchmark import SeasonalNaiveBenchmark
 from .config import ModelConfig
-from .data import get_study_population_series
+from .data import compute_fold_category_median_prices, get_study_population_series
 from .evaluate import predict_evaluation_origins
 from .reporting import generate_evaluation_artifacts
 from .train import select_best_objective, train_single_model, tune_hyperparameters
@@ -134,14 +134,24 @@ def main(argv=None) -> int:
         if gap < 1:
             raise ValueError(f"FATAL: Train targets overlap with evaluation targets in fold {fold_id}!")
 
+        # Compute fold category medians strictly on this fold's training origins (zero future price leakage)
+        fold_cat_medians = compute_fold_category_median_prices(trn_origs, sampled_ids, cfg)
+        log(f"  Fold training category median prices (zero lookahead): {fold_cat_medians}")
+
         # Validation split within training origins for early stopping (last 15% or at least 2 origins)
         val_count = max(2, int(len(trn_origs) * 0.15))
         sub_train = trn_origs[:-val_count]
         val_origs = trn_origs[-val_count:]
 
-        # Train fold-specific models for Matrix A, B, and C
+        # Train fold-specific models for Matrix A, B, C, and D
         fold_models = {}
-        for mat_name, mat_dir in [("model_A", cfg.matrix_A_dir), ("model_B", cfg.matrix_B_dir), ("model_C", cfg.matrix_C_dir)]:
+        model_specs = [
+            ("model_A", cfg.matrix_A_dir),
+            ("model_B", cfg.matrix_B_dir),
+            ("model_C", cfg.matrix_C_dir),
+            ("model_D", cfg.matrix_B_dir),
+        ]
+        for mat_name, mat_dir in model_specs:
             m_res = train_single_model(
                 matrix_dir=mat_dir,
                 matrix_name=f"{fold_id}_{mat_name}",
@@ -150,6 +160,7 @@ def main(argv=None) -> int:
                 sampled_ids=sampled_ids,
                 params=best_params,
                 cfg=cfg,
+                fold_cat_medians=fold_cat_medians,
                 log=log,
             )
             fold_models[mat_name] = m_res
@@ -157,9 +168,9 @@ def main(argv=None) -> int:
             m_res["booster"].save_model(str(model_save_path))
             all_trained_models[f"{fold_id}_{mat_name}"] = m_res
 
-        # If FINAL_TEST, also save standard alias files model_A.txt, model_B.txt, model_C.txt
+        # If FINAL_TEST, also save standard alias files model_A.txt, model_B.txt, model_C.txt, model_D.txt
         if is_final_test:
-            for mat_name in ["model_A", "model_B", "model_C"]:
+            for mat_name in ["model_A", "model_B", "model_C", "model_D"]:
                 fold_models[mat_name]["booster"].save_model(str(models_dir / f"{mat_name}.txt"))
 
         # Predict evaluation origins using THIS FOLD'S dedicated models
@@ -170,6 +181,7 @@ def main(argv=None) -> int:
             fold_id=fold_id,
             sampled_ids=sampled_ids,
             cfg=cfg,
+            fold_cat_medians=fold_cat_medians,
             log=log,
         )
         eval_predictions_by_fold.append(fold_preds)
@@ -203,15 +215,25 @@ def main(argv=None) -> int:
     # -------------------------------------------------------------------------
     # 9. Reproducibility Rerun Verification
     # -------------------------------------------------------------------------
-    log("Executing numerical reproducibility verification check...")
-    sample_verify = full_preds_df.head(1000).copy()
-    first_fold = sample_verify["fold_id"].iloc[0]
-    sample_model = all_trained_models[f"{first_fold}_model_A"]
+    log("Executing numerical reproducibility verification check on full origin slice...")
+    test_orig_id = eval_origs[0]
+    test_slice = full_preds_df[full_preds_df["origin_id"] == test_orig_id].copy()
+    n_test_rows = len(test_slice)
     
-    # Reload model and predict on sample rows
-    pf_A = pq.ParquetFile(cfg.matrix_A_dir / f"origin_id={sample_verify['origin_id'].iloc[0]}" / "data.parquet")
+    # Reload model A for final test and predict
+    sample_model = all_trained_models[f"FINAL_TEST_model_A"]
+    pf_A = pq.ParquetFile(cfg.matrix_A_dir / f"origin_id={test_orig_id}" / "data.parquet")
     sample_df_A = pf_A.read().to_pandas()
-    sample_df_A = sample_df_A[sample_df_A["id"].isin(sampled_ids)].head(1000)
+    sample_df_A = sample_df_A[sample_df_A["id"].isin(sampled_ids)].reset_index(drop=True)
+    
+    if fold_cat_medians is not None:
+        denom = sample_df_A["cat_id"].map(fold_cat_medians).astype(float)
+        sample_df_A["price_ratio_to_cat_median"] = np.where(
+            sample_df_A["last_price_known_at_origin"].notna(),
+            sample_df_A["last_price_known_at_origin"] / denom,
+            np.nan
+        ).astype(np.float32)
+        
     for c in sample_model["cat_cols"]:
         sample_df_A[c] = sample_df_A[c].astype("category")
         
@@ -219,9 +241,9 @@ def main(argv=None) -> int:
     if cfg.clip_nonnegative:
         rerun_preds = np.clip(rerun_preds, 0.0, None)
         
-    orig_preds = sample_verify["pred_A"].to_numpy()[:len(rerun_preds)]
+    orig_preds = test_slice["pred_A"].to_numpy()
     max_diff = float(np.max(np.abs(rerun_preds - orig_preds)))
-    log(f"Reproducibility verification check: max prediction difference = {max_diff:.2e}")
+    log(f"Reproducibility verification check on {n_test_rows:,} predictions: max absolute difference = {max_diff:.2e}")
     if max_diff < 1e-5:
         log("Reproducibility check: PASS (deterministic rerun within numerical tolerance).")
     else:

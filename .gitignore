@@ -27,6 +27,8 @@ Thumbs.db
 
 # Data (do not commit large datasets)
 /data/
+outputs/m5_cleaning/panel/
+outputs/m5_models/*.parquet
 
 # Logs
 *.log

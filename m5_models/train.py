@@ -191,6 +191,7 @@ def train_single_model(
     sampled_ids: Set[str],
     params: Dict,
     cfg: ModelConfig,
+    fold_cat_medians: Optional[Dict[str, float]] = None,
     log: callable = print,
 ) -> Dict:
     """Train one LightGBM model for specified matrix and origin partitions."""
@@ -201,10 +202,10 @@ def train_single_model(
     log(f"Training Model {matrix_name} ({len(train_origs)} train origins, {len(val_origs)} val origins)...")
     
     df_train, _, feat_cols, cat_cols = load_partition_subset(
-        matrix_dir, train_origs, sampled_ids, cfg
+        matrix_dir, train_origs, sampled_ids, cfg, matrix_name=matrix_name, fold_cat_medians=fold_cat_medians
     )
     df_val, _, _, _ = load_partition_subset(
-        matrix_dir, val_origs, sampled_ids, cfg
+        matrix_dir, val_origs, sampled_ids, cfg, matrix_name=matrix_name, fold_cat_medians=fold_cat_medians
     )
     
     trn_ds = prepare_lgb_dataset(df_train, feat_cols, cfg.label_col, cat_cols)

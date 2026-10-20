@@ -1,6 +1,6 @@
 # Pre-Training Gates and Data Contract Audit Report
 
-**Date**: 2026-10-20 10:01:13  
+**Date**: 2026-10-20 11:45:47  
 **Total Origins Audited**: 88 (Exhaustive across Matrix A, B, and C)  
 **Total Rows per Matrix**: 64,386,140 rows  
 
@@ -15,7 +15,7 @@
 | PRE_05 | Exhaustive (All 64,386,140 rows) | Nonnegative Observed Units Sold | 64,386,140 | 0 | **PASS** | target_units_sold >= 0 confirmed across all rows (no negative counts) |
 | PRE_06 | Exhaustive (All 88 origins x 3 matrices) | Exact Coordinate Equality (A == B == C) | 88 | 0 | **PASS** | Identical series ordering, row counts (64,386,140), and coordinates across A, B, and C |
 | PRE_07 | Exhaustive (All 5 folds) | Temporal Split Separation & Non-Contamination | 440 | 0 | **PASS** | All training labels strictly precede eval targets; final test starts exactly at d_1736 |
-| PRE_08 | Exhaustive (Feature Manifest) | Predictor Temporal Availability (<= O vs Known Calendar t) | 112 | 0 | **PASS** | Every sales/price feature strictly dated <= O; future calendar features strictly describe target date t |
+| PRE_08 | Exhaustive (112 Features in Manifest) | Predictor Temporal Availability (<= O vs Known Calendar t) | 112 | 0 | **PASS** | Programmatically verified: all sales and price features strictly bounded by <= O; calendar features strictly describe known target schedule |
 
 ## Data Contract Rules and Policies
 1. **Label Isolation**: `target_units_sold` is strictly treated as the training label and is excluded from all predictor matrices.

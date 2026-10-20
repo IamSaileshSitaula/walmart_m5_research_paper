@@ -56,10 +56,11 @@ def predict_evaluation_origins(
     fold_id: str,
     sampled_ids: Set[str],
     cfg: ModelConfig,
+    fold_cat_medians: Optional[Dict[str, float]] = None,
     log: callable = print,
 ) -> pd.DataFrame:
-    """Generate predictions for benchmark, Model A, Model B, and Model C on eval origins."""
-    log(f"Evaluating {len(eval_origs)} origins for fold {fold_id} across Benchmark, A, B, and C...")
+    """Generate predictions for benchmark, Model A, Model B, Model C, and Model D on eval origins."""
+    log(f"Evaluating {len(eval_origs)} origins for fold {fold_id} across Benchmark, A, B, C, and D...")
     
     # We will load origin by origin to keep memory light (< 100 MB per origin)
     all_preds_list = []
@@ -77,6 +78,15 @@ def predict_evaluation_origins(
         
         if len(df_A) == 0:
             continue
+            
+        # Update price_ratio_to_cat_median with fold training medians (zero look-ahead)
+        if fold_cat_medians is not None and "last_price_known_at_origin" in df_A.columns and "cat_id" in df_A.columns:
+            denom = df_A["cat_id"].map(fold_cat_medians).astype(float)
+            df_A["price_ratio_to_cat_median"] = np.where(
+                df_A["last_price_known_at_origin"].notna(),
+                df_A["last_price_known_at_origin"] / denom,
+                np.nan
+            ).astype(np.float32)
             
         coords = df_A[["id", "item_id", "dept_id", "cat_id", "store_id", "state_id",
                        "origin_id", "origin_d", "h", "target_d", "target_date", "target_units_sold",
@@ -103,6 +113,14 @@ def predict_evaluation_origins(
         tbl_B = pq.ParquetFile(p_B).read()
         df_B = tbl_B.to_pandas()
         df_B = df_B[df_B["id"].isin(sampled_ids)].reset_index(drop=True)
+        if fold_cat_medians is not None and "last_price_known_at_origin" in df_B.columns and "cat_id" in df_B.columns:
+            denom = df_B["cat_id"].map(fold_cat_medians).astype(float)
+            df_B["price_ratio_to_cat_median"] = np.where(
+                df_B["last_price_known_at_origin"].notna(),
+                df_B["last_price_known_at_origin"] / denom,
+                np.nan
+            ).astype(np.float32)
+            
         feat_B = models["model_B"]["feature_cols"]
         for c in models["model_B"]["cat_cols"]:
             df_B[c] = df_B[c].astype("category")
@@ -114,13 +132,20 @@ def predict_evaluation_origins(
         # Extract same-day event info
         coords["t_event_name_1"] = df_B["t_event_name_1"].astype(str)
         coords["t_no_event"] = df_B["t_no_event"].to_numpy()
-        del df_B
         
         # 5. Model C prediction
         p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
         tbl_C = pq.ParquetFile(p_C).read()
         df_C = tbl_C.to_pandas()
         df_C = df_C[df_C["id"].isin(sampled_ids)].reset_index(drop=True)
+        if fold_cat_medians is not None and "last_price_known_at_origin" in df_C.columns and "cat_id" in df_C.columns:
+            denom = df_C["cat_id"].map(fold_cat_medians).astype(float)
+            df_C["price_ratio_to_cat_median"] = np.where(
+                df_C["last_price_known_at_origin"].notna(),
+                df_C["last_price_known_at_origin"] / denom,
+                np.nan
+            ).astype(np.float32)
+            
         feat_C = models["model_C"]["feature_cols"]
         for c in models["model_C"]["cat_cols"]:
             df_C[c] = df_C[c].astype("category")
@@ -135,8 +160,20 @@ def predict_evaluation_origins(
         if "ph_christmas" in df_C.columns:
             coords["ph_christmas"] = df_C["ph_christmas"].astype(str)
             
-        del df_C
-        
+        # 6. Model D prediction (Matrix B + C event-window features)
+        if "model_D" in models:
+            c_extra = [c for c in df_C.columns if c.startswith("ph_") or c.startswith("k_")]
+            df_D = pd.concat([df_B, df_C[c_extra]], axis=1)
+            feat_D = models["model_D"]["feature_cols"]
+            for c in models["model_D"]["cat_cols"]:
+                df_D[c] = df_D[c].astype("category")
+            pred_D = models["model_D"]["booster"].predict(df_D[feat_D])
+            if cfg.clip_nonnegative:
+                pred_D = np.clip(pred_D, 0.0, None)
+            coords["pred_D"] = pred_D
+            del df_D
+            
+        del df_B, df_C
         all_preds_list.append(coords)
         
     full_preds = pd.concat(all_preds_list, ignore_index=True)
@@ -147,12 +184,16 @@ def predict_evaluation_origins(
     full_preds["err_A"] = full_preds["pred_A"] - y
     full_preds["err_B"] = full_preds["pred_B"] - y
     full_preds["err_C"] = full_preds["pred_C"] - y
+    if "pred_D" in full_preds.columns:
+        full_preds["err_D"] = full_preds["pred_D"] - y
     
     # Absolute errors
     full_preds["abs_err_bench"] = np.abs(full_preds["err_bench"])
     full_preds["abs_err_A"] = np.abs(full_preds["err_A"])
     full_preds["abs_err_B"] = np.abs(full_preds["err_B"])
     full_preds["abs_err_C"] = np.abs(full_preds["err_C"])
+    if "pred_D" in full_preds.columns:
+        full_preds["abs_err_D"] = np.abs(full_preds["err_D"])
     
     # Assign general event phase category
     # Check if either Thanksgiving or Christmas is active, else check other events
@@ -229,6 +270,17 @@ def aggregate_strata_metrics(
         m_B = compute_metrics(y, sub["pred_B"].to_numpy())
         m_C = compute_metrics(y, sub["pred_C"].to_numpy())
         
+        has_D = "pred_D" in sub.columns
+        if has_D:
+            m_D = compute_metrics(y, sub["pred_D"].to_numpy())
+            d_DB_mae = m_D["mae"] - m_B["mae"]
+            d_DB_pct = (d_DB_mae / m_B["mae"] * 100.0) if m_B["mae"] > 0 else np.nan
+            d_DA_mae = m_D["mae"] - m_A["mae"]
+            d_DA_pct = (d_DA_mae / m_A["mae"] * 100.0) if m_A["mae"] > 0 else np.nan
+        else:
+            m_D = {"mae": np.nan, "bias": np.nan, "rmse": np.nan, "wape": np.nan}
+            d_DB_mae, d_DB_pct, d_DA_mae, d_DA_pct = np.nan, np.nan, np.nan, np.nan
+        
         # Paired differences
         d_BA_mae = m_B["mae"] - m_A["mae"]
         d_CB_mae = m_C["mae"] - m_B["mae"]
@@ -246,26 +298,34 @@ def aggregate_strata_metrics(
             "mae_A": m_A["mae"],
             "mae_B": m_B["mae"],
             "mae_C": m_C["mae"],
+            "mae_D": m_D["mae"],
             # Bias (forecast - observed)
             "bias_bench": m_bench["bias"],
             "bias_A": m_A["bias"],
             "bias_B": m_B["bias"],
             "bias_C": m_C["bias"],
+            "bias_D": m_D["bias"],
             # RMSE
             "rmse_bench": m_bench["rmse"],
             "rmse_A": m_A["rmse"],
             "rmse_B": m_B["rmse"],
             "rmse_C": m_C["rmse"],
+            "rmse_D": m_D["rmse"],
             # WAPE
             "wape_bench": m_bench["wape"],
             "wape_A": m_A["wape"],
             "wape_B": m_B["wape"],
             "wape_C": m_C["wape"],
+            "wape_D": m_D["wape"],
             # Differences
             "delta_BA_mae": d_BA_mae,
             "delta_BA_pct": d_BA_pct,
             "delta_CB_mae": d_CB_mae,
             "delta_CB_pct": d_CB_pct,
+            "delta_DB_mae": d_DB_mae,
+            "delta_DB_pct": d_DB_pct,
+            "delta_DA_mae": d_DA_mae,
+            "delta_DA_pct": d_DA_pct,
         })
         
     return pd.DataFrame(records)

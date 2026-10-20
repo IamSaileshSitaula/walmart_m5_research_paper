@@ -40,12 +40,18 @@ class ModelConfig:
     # Forecasting parameters
     horizon: int = 28
     label_col: str = "target_units_sold"
+    # Key columns identifying rows/coordinates
     key_cols: List[str] = field(default_factory=lambda: [
         "id", "origin_id", "origin_d", "origin_date", "h", "target_d", "target_date"
+    ])
+    # Feature columns to exclude from predictor matrix X (retains 'h' as a numeric predictor!)
+    feature_excluded_cols: List[str] = field(default_factory=lambda: [
+        "id", "origin_id", "origin_d", "origin_date", "target_d", "target_date"
     ])
     static_cats: List[str] = field(default_factory=lambda: [
         "item_id", "dept_id", "cat_id", "store_id", "state_id"
     ])
+    models_to_train: List[str] = field(default_factory=lambda: ["A", "B", "C", "D"])
 
     # Objective selection: compare regression_l1 vs poisson on DEV_S2012
     candidate_objectives: List[str] = field(default_factory=lambda: ["regression_l1", "poisson"])

@@ -29,40 +29,106 @@ def get_study_population_series(
     return sampled_ids, df_study
 
 
+def compute_fold_category_median_prices(
+    origin_ids: List[str],
+    sampled_ids: Set[str],
+    cfg: ModelConfig,
+) -> Dict[str, float]:
+    """Compute category median price strictly using the fold's training origins.
+    
+    Eliminates price look-ahead for earlier development folds.
+    """
+    prices_by_cat = {}
+    for orig_id in origin_ids:
+        p = cfg.matrix_A_dir / f"origin_id={orig_id}" / "data.parquet"
+        if not p.exists():
+            continue
+        tbl = pq.ParquetFile(p).read(columns=["id", "cat_id", "last_price_known_at_origin"])
+        df = tbl.to_pandas()
+        df = df[df["id"].isin(sampled_ids)].drop_duplicates("id")
+        for cat, g in df.groupby("cat_id", observed=True):
+            valid = g["last_price_known_at_origin"].dropna().to_numpy()
+            if cat not in prices_by_cat:
+                prices_by_cat[cat] = []
+            prices_by_cat[cat].extend(valid)
+            
+    cat_medians = {}
+    for cat, vals in prices_by_cat.items():
+        cat_medians[cat] = float(np.median(vals)) if len(vals) > 0 else 1.0
+    return cat_medians
+
+
 def load_partition_subset(
     matrix_dir: Path,
     origin_ids: List[str],
     sampled_ids: Set[str],
     cfg: ModelConfig,
+    matrix_name: Optional[str] = None,
+    fold_cat_medians: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
-    """Load and concatenate data for specified origins and study population."""
+    """Load and concatenate data for specified origins and study population.
+    
+    Retains forecast horizon 'h' as an explicit numeric predictor.
+    Supports Matrix D = Matrix B (same-day events) + Matrix C (event-window phase and timing).
+    Applies fold-specific category median price normalization if provided.
+    """
     dfs = []
     coords_dfs = []
     
-    # Feature columns to exclude from training
-    drop_from_X = set(cfg.key_cols + [cfg.label_col])
+    # Feature columns to exclude from training (keeps 'h' in X!)
+    drop_from_X = set(cfg.feature_excluded_cols + [cfg.label_col])
+    
+    is_matrix_D = (matrix_name is not None and ("model_D" in matrix_name or "matrix_D" in matrix_name)) or (matrix_dir.name in ["matrix_D", "model_D"])
     
     feature_cols = None
     cat_cols = None
 
     for orig_id in origin_ids:
-        p = matrix_dir / f"origin_id={orig_id}" / "data.parquet"
-        if not p.exists():
-            continue
-        
-        pf = pq.ParquetFile(p)
-        tbl = pf.read()
-        df = tbl.to_pandas()
-        
-        # Filter to study population series
-        df_sub = df[df["id"].isin(sampled_ids)].copy()
+        if is_matrix_D:
+            p_B = cfg.matrix_B_dir / f"origin_id={orig_id}" / "data.parquet"
+            p_C = cfg.matrix_C_dir / f"origin_id={orig_id}" / "data.parquet"
+            if not p_B.exists() or not p_C.exists():
+                continue
+            
+            df_B = pq.ParquetFile(p_B).read().to_pandas()
+            b_mask = df_B["id"].isin(sampled_ids).to_numpy()
+            df_B_sub = df_B[b_mask].reset_index(drop=True)
+            
+            pf_C = pq.ParquetFile(p_C)
+            c_extra = [c for c in pf_C.schema.names if c.startswith("ph_") or c.startswith("k_")]
+            df_C_extra = pf_C.read(columns=c_extra).to_pandas()
+            df_C_sub = df_C_extra[b_mask].reset_index(drop=True)
+            
+            df_sub = pd.concat([df_B_sub, df_C_sub], axis=1)
+        else:
+            p = matrix_dir / f"origin_id={orig_id}" / "data.parquet"
+            if not p.exists():
+                continue
+            
+            pf = pq.ParquetFile(p)
+            tbl = pf.read()
+            df = tbl.to_pandas()
+            df_sub = df[df["id"].isin(sampled_ids)].copy().reset_index(drop=True)
+            
         if len(df_sub) == 0:
             continue
             
+        # Recompute price_ratio_to_cat_median using fold-specific training medians (zero look-ahead)
+        if fold_cat_medians is not None and "last_price_known_at_origin" in df_sub.columns and "cat_id" in df_sub.columns:
+            denom = df_sub["cat_id"].map(fold_cat_medians).astype(float)
+            df_sub["price_ratio_to_cat_median"] = np.where(
+                df_sub["last_price_known_at_origin"].notna(),
+                df_sub["last_price_known_at_origin"] / denom,
+                np.nan
+            ).astype(np.float32)
+            
         if feature_cols is None:
             feature_cols = [c for c in df_sub.columns if c not in drop_from_X]
-            # Identify categoricals
-            cat_cols = [c for c in feature_cols if str(df_sub[c].dtype) == "category" or df_sub[c].dtype == object]
+            # Ensure 'h' is present
+            if "h" not in feature_cols and "h" in df_sub.columns:
+                feature_cols.insert(0, "h")
+            # Identify categoricals (ensure all ph_ event phases are treated as native categoricals)
+            cat_cols = [c for c in feature_cols if str(df_sub[c].dtype) == "category" or df_sub[c].dtype == object or c.startswith("ph_")]
         
         # Keep coordinate columns separately
         coord_df = df_sub[["id", "origin_id", "origin_d", "h", "target_d", "target_date", "target_units_sold"]].copy()

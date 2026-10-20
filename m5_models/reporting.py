@@ -60,6 +60,11 @@ def generate_evaluation_artifacts(
         m_A = compute_metrics(y, sub_preds["pred_A"].to_numpy())
         m_B = compute_metrics(y, sub_preds["pred_B"].to_numpy())
         m_C = compute_metrics(y, sub_preds["pred_C"].to_numpy())
+        has_D = "pred_D" in sub_preds.columns
+        if has_D:
+            m_D = compute_metrics(y, sub_preds["pred_D"].to_numpy())
+        else:
+            m_D = {"mae": np.nan, "bias": np.nan}
         
         audit_rows.append({
             "fold": f_id,
@@ -78,8 +83,11 @@ def generate_evaluation_artifacts(
             "bias_B": m_B["bias"],
             "mae_C": m_C["mae"],
             "bias_C": m_C["bias"],
+            "mae_D": m_D["mae"],
+            "bias_D": m_D["bias"],
             "delta_BA_pct": (m_B["mae"] - m_A["mae"]) / m_A["mae"] * 100.0 if m_A["mae"] > 0 else np.nan,
             "delta_CB_pct": (m_C["mae"] - m_B["mae"]) / m_B["mae"] * 100.0 if m_B["mae"] > 0 else np.nan,
+            "delta_DB_pct": (m_D["mae"] - m_B["mae"]) / m_B["mae"] * 100.0 if (has_D and m_B["mae"] > 0) else np.nan,
         })
         
     df_audit_table = pd.DataFrame(audit_rows)
@@ -126,8 +134,19 @@ def generate_evaluation_artifacts(
     # 5. DEDICATED UNDERFORECASTING BIAS INVESTIGATION
     log("Conducting dedicated underforecasting bias investigation...")
     bias_records = []
+    has_D = "pred_D" in df_preds.columns
+    
     # Overall
-    for m_label, m_col in [("Seasonal Naive", "pred_bench"), ("Model A (No Events)", "pred_A"), ("Model B (Same-Day)", "pred_B"), ("Model C (Event Phase)", "pred_C")]:
+    model_tuples = [
+        ("Seasonal Naive", "pred_bench"),
+        ("Model A (No Events)", "pred_A"),
+        ("Model B (Same-Day)", "pred_B"),
+        ("Model C (Event Phase)", "pred_C"),
+    ]
+    if has_D:
+        model_tuples.append(("Model D (Event Windows)", "pred_D"))
+        
+    for m_label, m_col in model_tuples:
         y = df_preds["target_units_sold"].to_numpy()
         pred = df_preds[m_col].to_numpy()
         mask = df_preds["bench_available"].to_numpy() if m_col == "pred_bench" else None
@@ -145,10 +164,14 @@ def generate_evaluation_artifacts(
         })
         
     # By Volume Tier (Low, Medium, High)
+    vt_models = [("Model A", "pred_A"), ("Model B", "pred_B"), ("Model C", "pred_C")]
+    if has_D:
+        vt_models.append(("Model D", "pred_D"))
+        
     for v_tier in ["Low Volume", "Medium Volume", "High Volume"]:
         sub_v = df_preds[df_preds["volume_tier"] == v_tier]
         y_v = sub_v["target_units_sold"].to_numpy()
-        for m_label, m_col in [("Model A", "pred_A"), ("Model B", "pred_B"), ("Model C", "pred_C")]:
+        for m_label, m_col in vt_models:
             pred_v = sub_v[m_col].to_numpy()
             met_v = compute_metrics(y_v, pred_v)
             bias_records.append({
@@ -167,7 +190,7 @@ def generate_evaluation_artifacts(
     for phase_val in ["pre_1", "pre_7_2", "day_0", "post_1_3", "outside"]:
         sub_p = df_preds[df_preds["primary_phase"] == phase_val]
         y_p = sub_p["target_units_sold"].to_numpy()
-        for m_label, m_col in [("Model A", "pred_A"), ("Model B", "pred_B"), ("Model C", "pred_C")]:
+        for m_label, m_col in vt_models:
             pred_p = sub_p[m_col].to_numpy()
             met_p = compute_metrics(y_p, pred_p)
             bias_records.append({
@@ -203,7 +226,10 @@ def generate_evaluation_artifacts(
     saved_files["xm_leads"] = out_dir / "christmas_lead_metrics.csv"
 
     # 7. Sensitivity Analysis: Repeated Target Dates
-    df_uniq_targets = df_preds.groupby(["id", "target_d"])[["target_units_sold", "pred_bench", "pred_A", "pred_B", "pred_C", "bench_available"]].mean().reset_index()
+    target_cols = ["target_units_sold", "pred_bench", "pred_A", "pred_B", "pred_C", "bench_available"]
+    if has_D:
+        target_cols.append("pred_D")
+    df_uniq_targets = df_preds.groupby(["id", "target_d"])[target_cols].mean().reset_index()
     df_uniq_targets["bench_available"] = df_uniq_targets["bench_available"] > 0.5
     sens_all = aggregate_strata_metrics(df_preds.assign(dataset="All Decision Rows (Repeated Leads Included)"), "dataset", False)
     sens_uniq = aggregate_strata_metrics(df_uniq_targets.assign(dataset="Unique Target Dates (Averaged Over Leads)"), "dataset", False)
@@ -213,11 +239,8 @@ def generate_evaluation_artifacts(
 
     # 8. HOLIDAY EPISODE AND FOLD-LEVEL PAIRED COMPARISONS (Replacing row-level hypothesis testing)
     log("Computing holiday episode and fold-level paired comparisons...")
-    # Form explicit holiday episodes
-    # Tag each row with its specific holiday episode
     def get_holiday_episode(row):
         f_id = row["fold_id"]
-        ev = row["event_name"]
         ph_th = row.get("ph_thanksgiving", "outside")
         ph_xm = row.get("ph_christmas", "outside")
         yr = "2012" if "2012" in f_id else ("2013" if "2013" in f_id else ("2014" if "2014" in f_id else "2015"))
@@ -237,7 +260,8 @@ def generate_evaluation_artifacts(
         mC = compute_metrics(y, grp["pred_C"].to_numpy())
         d_BA = mB["mae"] - mA["mae"]
         d_CB = mC["mae"] - mB["mae"]
-        episode_records.append({
+        
+        ep_rec = {
             "holiday_episode": ep_name,
             "n_predictions": len(grp),
             "mean_observed": mA["mean_y"],
@@ -250,50 +274,78 @@ def generate_evaluation_artifacts(
             "delta_CB_pct": (d_CB / mB["mae"] * 100.0) if mB["mae"] > 0 else np.nan,
             "C_beats_B": d_CB < 0,
             "B_beats_A": d_BA < 0,
-        })
+        }
+        if has_D:
+            mD = compute_metrics(y, grp["pred_D"].to_numpy())
+            d_DB = mD["mae"] - mB["mae"]
+            ep_rec["mae_D"] = mD["mae"]
+            ep_rec["delta_DB_mae"] = d_DB
+            ep_rec["delta_DB_pct"] = (d_DB / mB["mae"] * 100.0) if mB["mae"] > 0 else np.nan
+            ep_rec["D_beats_B"] = d_DB < 0
+            
+        episode_records.append(ep_rec)
+        
     df_episode_paired = pd.DataFrame(episode_records)
     df_episode_paired.to_csv(out_dir / "holiday_episode_paired_comparisons.csv", index=False)
     saved_files["episode_paired"] = out_dir / "holiday_episode_paired_comparisons.csv"
 
-    # 9. Worked Forecast Examples
+    # 9. SKU ATTENTION RULE CALIBRATION & 2015 EXPLORATORY EVALUATION
+    from .sku_attention import evaluate_sku_attention_rule
+    sku_ranked, top50_df, attention_md = evaluate_sku_attention_rule(df_preds, out_dir, top_k=50, log=log)
+    saved_files["sku_attention_ranked"] = out_dir / "sku_attention_ranked_list.csv"
+    saved_files["sku_attention_top50"] = out_dir / "sku_attention_2015_performance.csv"
+    saved_files["sku_attention_report"] = out_dir / "sku_attention_report.md"
+
+    # 10. Worked Forecast Examples
     foods_ex = df_preds[(df_preds["cat_id"] == "FOODS") & (df_preds["store_id"] == "CA_3")]
     sample_th_day = foods_ex[foods_ex["primary_phase"] == "day_0"].head(2)
     sample_th_eve = foods_ex[foods_ex["primary_phase"] == "pre_1"].head(2)
     sample_post = foods_ex[foods_ex["primary_phase"] == "post_1_3"].head(2)
     sample_ord = foods_ex[foods_ex["primary_phase"] == "outside"].head(2)
     df_worked = pd.concat([sample_th_day, sample_th_eve, sample_post, sample_ord], ignore_index=True)
-    df_worked_clean = df_worked[[
+    
+    worked_cols = [
         "id", "store_id", "dept_id", "origin_id", "origin_d", "h", "target_d", "target_date",
         "primary_phase", "event_name", "target_units_sold",
         "pred_bench", "pred_A", "pred_B", "pred_C",
         "err_bench", "err_A", "err_B", "err_C"
-    ]].rename(columns={"target_units_sold": "observed_units"})
+    ]
+    if has_D:
+        worked_cols.extend(["pred_D", "err_D"])
+        
+    df_worked_clean = df_worked[worked_cols].rename(columns={"target_units_sold": "observed_units"})
     df_worked_clean.to_csv(out_dir / "worked_forecast_examples.csv", index=False)
     saved_files["worked_csv"] = out_dir / "worked_forecast_examples.csv"
 
-    # 10. Write Evaluation Summary Markdown
+    # 11. Write Evaluation Summary Markdown
     eval_summary_md = [
         "# M5 Direct Multi-Horizon Forecasting: Fold-Provenance Audit & Evaluation Report",
         "",
         f"**Date**: {time.strftime('%Y-%m-%d %H:%M:%S')}  ",
         f"**Study Population**: Systematic 10% item sample ({len(df_preds['id'].unique()):,} item–store series; 305 items across 10 stores)  ",
         f"**Total Out-of-Sample Predictions**: {len(df_preds):,} rows across 54 evaluation origins  ",
-        f"**Target Horizons**: $h = 1, \\dots, 28$ direct direct multi-horizon  ",
+        f"**Target Horizons**: $h = 1, \\dots, 28$ direct multi-horizon (forecast lead $h$ included in predictors)  ",
         "",
         "## 1. Fold-Provenance and Temporal Boundary Audit",
         "",
         "Every fold's predictions were generated strictly by models trained on origins dated prior to that fold's evaluation window.",
+        "Price normalization features were recomputed using fold-specific training medians (zero future price leakage).",
         "",
-        "| Fold | Role | Model Used | Max Training Target Date | Min Evaluated Target Date | Temporal Gap | Gate | N Rows | MAE Bench | MAE A | MAE B | MAE C | Bias C | $\\Delta$ (B - A) | $\\Delta$ (C - B) |",
+        "| Fold | Role | Model Used | Max Training Target Date | Min Evaluated Target Date | Temporal Gap | Gate | N Rows | MAE Bench | MAE A | MAE B | MAE C | MAE D | $\\Delta$ (B - A) | $\\Delta$ (D - B) |",
         "|---|---|---|---|---|:---:|:---:|---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
     for r in df_audit_table.itertuples():
+        d_val = f"{r.mae_D:.4f}" if hasattr(r, "mae_D") and not np.isnan(r.mae_D) else "N/A"
+        delta_db = f"{r.delta_DB_pct:+.2f}%" if hasattr(r, "delta_DB_pct") and not np.isnan(r.delta_DB_pct) else "N/A"
         eval_summary_md.append(
-            f"| `{r.fold}` | {r.role} | `{r.model_used}` | {r.max_training_target_date} | {r.min_evaluated_target_date} | +{r.temporal_gap_days}d | **{r.leak_free_gate}** | {r.number_of_predictions:,} | {r.mae_bench:.4f} | {r.mae_A:.4f} | {r.mae_B:.4f} | {r.mae_C:.4f} | {r.bias_C:+.3f} | {r.delta_BA_pct:+.2f}% | {r.delta_CB_pct:+.2f}% |"
+            f"| `{r.fold}` | {r.role} | `{r.model_used}` | {r.max_training_target_date} | {r.min_evaluated_target_date} | +{r.temporal_gap_days}d | **{r.leak_free_gate}** | {r.number_of_predictions:,} | {r.mae_bench:.4f} | {r.mae_A:.4f} | {r.mae_B:.4f} | {r.mae_C:.4f} | {d_val} | {r.delta_BA_pct:+.2f}% | {delta_db} |"
         )
 
     # Standalone Frozen Final Test
     final_test_row = df_audit_table[df_audit_table["fold"] == "FINAL_TEST"].iloc[0]
+    final_mae_D = f"{final_test_row['mae_D']:.4f}" if hasattr(final_test_row, "mae_D") else "N/A"
+    final_delta_DB = f"{final_test_row['delta_DB_pct']:+.2f}%" if hasattr(final_test_row, "delta_DB_pct") else "N/A"
+    
     eval_summary_md.extend([
         "",
         "## 2. Frozen Final Test Performance (Holiday Season 2015 + Evaluation Period)",
@@ -307,18 +359,22 @@ def generate_evaluation_artifacts(
         f"- **Seasonal-Naive Benchmark MAE**: **{final_test_row['mae_bench']:.4f}** (Bias: {final_test_row['bias_bench']:+.3f}).",
         f"- **Model A (No Events) MAE**: **{final_test_row['mae_A']:.4f}** (Bias: {final_test_row['bias_A']:+.3f}).",
         f"- **Model B (Same-Day Events) MAE**: **{final_test_row['mae_B']:.4f}** ({final_test_row['delta_BA_pct']:+.2f}% vs A; Bias: {final_test_row['bias_B']:+.3f}).",
-        f"- **Model C (Event Phase & Timing) MAE**: **{final_test_row['mae_C']:.4f}** ({final_test_row['delta_CB_pct']:+.2f}% vs B, -1.19% vs A; Bias: {final_test_row['bias_C']:+.3f}).",
+        f"- **Model C (Event Phase & Timing) MAE**: **{final_test_row['mae_C']:.4f}** ({final_test_row['delta_CB_pct']:+.2f}% vs B; Bias: {final_test_row['bias_C']:+.3f}).",
+        f"- **Model D (Same-Day Events + Event Windows) MAE**: **{final_mae_D}** ({final_delta_DB} vs B; marginal value of adding windows to same-day events).",
         "",
         "## 3. Holiday Episode-Level Paired Comparisons",
         "",
         "To avoid pseudo-replication from treating dependent SKU rows around the same holiday as independent evidence, performance is aggregated by holiday episode across the 4 observed seasons:",
         "",
-        "| Holiday Episode | N Rows | Mean Observed | MAE A (No Event) | MAE B (Same-Day) | MAE C (Event Phase) | $\\Delta$ (B - A) % | $\\Delta$ (C - B) % | C Outperforms B? |",
-        "|---|---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
+        "| Holiday Episode | N Rows | Mean Observed | MAE A (No Event) | MAE B (Same-Day) | MAE C (Event Phase) | MAE D (Event Windows) | $\\Delta$ (B - A) % | $\\Delta$ (D - B) % | D Outperforms B? |",
+        "|---|---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ])
     for r in df_episode_paired.itertuples():
+        d_val = f"{r.mae_D:.4f}" if hasattr(r, "mae_D") and not np.isnan(r.mae_D) else "N/A"
+        delta_db = f"{r.delta_DB_pct:+.2f}%" if hasattr(r, "delta_DB_pct") and not np.isnan(r.delta_DB_pct) else "N/A"
+        d_beats = "**Yes**" if hasattr(r, "D_beats_B") and r.D_beats_B else "No"
         eval_summary_md.append(
-            f"| `{r.holiday_episode}` | {r.n_predictions:,} | {r.mean_observed:.2f} | {r.mae_A:.4f} | {r.mae_B:.4f} | {r.mae_C:.4f} | {r.delta_BA_pct:+.2f}% | {r.delta_CB_pct:+.2f}% | {'**Yes**' if r.C_beats_B else 'No'} |"
+            f"| `{r.holiday_episode}` | {r.n_predictions:,} | {r.mean_observed:.2f} | {r.mae_A:.4f} | {r.mae_B:.4f} | {r.mae_C:.4f} | {d_val} | {r.delta_BA_pct:+.2f}% | {delta_db} | {d_beats} |"
         )
 
     eval_summary_md.extend([
@@ -340,10 +396,18 @@ def generate_evaluation_artifacts(
     eval_summary_md.extend([
         "",
         "### Operational Inventory Implications of Median Forecasting",
-        "- **Stockout Risk**: An unadjusted L1 median forecast ($\hat{y}_{50}$) will stock out on approximately 50% of replenishment cycles for intermittent items where demand exceeds the median.",
-        "- **High-Volume Items**: For high-volume items (mean observed sales = 3.24 units), the negative bias reaches **-0.95 units per day** (-29.3% underforecasting).",
-        "- **Pre-Holiday Demand Surges**: On Day -1 (`pre_1`, Thanksgiving/Christmas Eve), demand rises to 1.37 units, but Model A/B/C forecast ~0.85 units, resulting in a **-0.52 unit daily shortfall**.",
-        "- **Recommendation for Inventory Simulation**: For downstream inventory simulation, median forecasts must be combined with an asymmetric quantile buffer ($\hat{y}_q$ for $q \\ge 0.75$) or safety stock calculated from residual variance, rather than raw point predictions.",
+        "- **Stockout Risk**: An unadjusted L1 median forecast ($\\hat{y}_{50}$) will stock out on approximately 50% of replenishment cycles for intermittent items where demand exceeds the median.",
+        "- **High-Volume Items**: For high-volume items, underforecasting reaches -20% to -30% of sales volume.",
+        "- **Pre-Holiday Demand Surges**: On Day -1 (`pre_1`, Thanksgiving/Christmas Eve), demand surges while models forecast the median, creating an acute shortfall.",
+        "- **Recommendation for Inventory Simulation**: For downstream inventory simulation, median forecasts must be combined with an asymmetric quantile buffer ($\\hat{y}_q$ for $q \\ge 0.75$) or safety stock calculated from residual variance, rather than raw point predictions.",
+        "",
+        "## 5. SKU Attention Rule: Summary of Findings",
+        "",
+        "> [!NOTE]",
+        "> Detailed audit and SKU-by-SKU outcomes are saved in [sku_attention_report.md](file:///outputs/m5_models/sku_attention_report.md).",
+        f"- **Calibration Scope**: Calibrated strictly on development holiday episodes (`DEV_S2012`–`DEV_S2014`) by ranking 28-day cumulative order discrepancies between Model B and Model D.",
+        "- **Review List Size**: Top 50 highest-discrepancy SKU-store pairs (1.6% of series).",
+        "- **Exploratory 2015 Evaluation**: Examines whether attending to high-discrepancy SKUs improves 2015 holiday forecasting, while rigorously reporting regressions where Model D underperforms Model B.",
     ])
 
     (out_dir / "evaluation_summary.md").write_text("\n".join(eval_summary_md), encoding="utf-8")
