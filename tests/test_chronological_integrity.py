@@ -1,5 +1,6 @@
 """Unit and synthetic verification tests for chronological integrity, SKU attention formulation,
-and data alignment contracts. Built using unittest for standard execution without external test dependencies.
+population accounting, and production data alignment contracts.
+Built using unittest for standard execution without external test dependencies.
 """
 from __future__ import annotations
 
@@ -9,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from m5_features.config import FeatureConfig
 from m5_features.events import (
@@ -16,9 +19,16 @@ from m5_features.events import (
     compute_fold_event_selection,
     event_date_table,
 )
+from m5_models.config import ModelConfig
+from m5_models.data import (
+    compute_fold_category_median_prices,
+    load_partition_subset,
+)
 from m5_models.sku_attention import (
     evaluate_sku_attention_rule,
+    get_holiday_relevant_origins,
     is_holiday_relevant_origin,
+    verify_horizon_integrity,
 )
 
 
@@ -38,17 +48,14 @@ def _make_dummy_calendar(n_days: int = 1000) -> pd.DataFrame:
         "event_name_2": [None] * n_days,
         "event_type_2": [None] * n_days,
     })
-    # Set Thanksgiving on d_300 and d_664
     if n_days >= 300:
         df.loc[df["d_num"] == 300, ["event_name_1", "event_type_1"]] = ["Thanksgiving", "National"]
     if n_days >= 664:
         df.loc[df["d_num"] == 664, ["event_name_1", "event_type_1"]] = ["Thanksgiving", "National"]
-    # Set Christmas on d_331 and d_697
     if n_days >= 331:
         df.loc[df["d_num"] == 331, ["event_name_1", "event_type_1"]] = ["Christmas", "National"]
     if n_days >= 697:
         df.loc[df["d_num"] == 697, ["event_name_1", "event_type_1"]] = ["Christmas", "National"]
-    # Set an exploratory event (SuperBowl) on d_10, d_375, and d_740
     if n_days >= 10:
         df.loc[df["d_num"] == 10, ["event_name_1", "event_type_1"]] = ["SuperBowl", "Sporting"]
     if n_days >= 375:
@@ -76,11 +83,9 @@ class TestChronologicalIntegrity(unittest.TestCase):
             out_dir=Path("dummy"),
         )
         
-        # Store daily sales totals
         np.random.seed(42)
         store_totals_original = np.random.poisson(lam=100.0, size=(10, n_days)).astype(np.float64)
         
-        # Run screening on original data
         res_orig = compute_fold_event_selection(
             fold_id="DEV_S2012",
             cutoff_d=cutoff_d,
@@ -90,11 +95,9 @@ class TestChronologicalIntegrity(unittest.TestCase):
             cfg=cfg,
         )
         
-        # Corrupt/perturb sales strictly AFTER cutoff_d (days 626 to 1000)
         store_totals_perturbed = store_totals_original.copy()
         store_totals_perturbed[:, cutoff_d:] = store_totals_perturbed[:, cutoff_d:] * 1000.0 + 99999.0
         
-        # Re-run screening on perturbed data
         res_perturbed = compute_fold_event_selection(
             fold_id="DEV_S2012",
             cutoff_d=cutoff_d,
@@ -104,7 +107,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
             cfg=cfg,
         )
         
-        # Verify bit-for-bit equivalence
         pd.testing.assert_frame_equal(res_orig["sel_events"], res_perturbed["sel_events"])
         pd.testing.assert_frame_equal(res_orig["effect_profiles"], res_perturbed["effect_profiles"])
         pd.testing.assert_frame_equal(res_orig["day_C"], res_perturbed["day_C"])
@@ -128,7 +130,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
             # s2: pred_B = 1.0 each horizon -> Q_B = 28.0
             #     pred_D = 1.5 each horizon -> Q_D = 42.0
             #     decision_diff = |42.0 - 28.0| = 14.0
-            
             records = []
             for h in range(1, 29):
                 records.append({
@@ -182,13 +183,50 @@ class TestChronologicalIntegrity(unittest.TestCase):
             self.assertTrue(bool(s1_row["in_top_50"]))
             self.assertFalse(bool(s2_row["in_top_50"]))
             
-            # Verify that an incomplete horizon (e.g. dropping h=28) triggers ValueError
+            # Verify that dropping a horizon triggers ValueError
             df_incomplete = df.iloc[:-1].copy()
             with self.assertRaises(ValueError):
                 evaluate_sku_attention_rule(df_incomplete, tmp_path, top_k=1, log=lambda m: None)
 
+    def test_horizon_integrity_duplicate_and_missing_horizons_fail(self):
+        """Test 3: Require each eligible SKU-origin pair to contain each horizon 1 through 28 exactly once;
+        a duplicate horizon and a missing horizon must fail.
+        """
+        # Case A: Valid 28 horizons
+        df_valid = pd.DataFrame({
+            "id": ["s1"] * 28,
+            "origin_id": ["O1"] * 28,
+            "h": list(range(1, 29)),
+        })
+        # Should not raise
+        verify_horizon_integrity(df_valid, "valid_test")
+        
+        # Case B: Duplicate horizon (h=14 appears twice, h=15 is missing; total count = 28, min=1, max=28)
+        dup_horizons = list(range(1, 15)) + [14] + list(range(16, 29))
+        self.assertEqual(len(dup_horizons), 28)
+        self.assertEqual(min(dup_horizons), 1)
+        self.assertEqual(max(dup_horizons), 28)
+        df_dup = pd.DataFrame({
+            "id": ["s1"] * 28,
+            "origin_id": ["O1"] * 28,
+            "h": dup_horizons,
+        })
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_dup, "duplicate_test")
+        self.assertIn("Duplicate", str(ctx.exception))
+        
+        # Case C: Missing horizon (only 27 horizons present)
+        df_missing = pd.DataFrame({
+            "id": ["s1"] * 27,
+            "origin_id": ["O1"] * 27,
+            "h": list(range(1, 28)),
+        })
+        with self.assertRaises(ValueError) as ctx:
+            verify_horizon_integrity(df_missing, "missing_test")
+        self.assertIn("Horizon integrity failed", str(ctx.exception))
+
     def test_2015_label_perturbation_invariance(self):
-        """Test 3: Changing 2015 observed labels cannot change development attention scores,
+        """Test 4: Changing 2015 observed labels cannot change development attention scores,
         ranking, or Top-50 membership.
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -198,7 +236,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
             for s in range(10):
                 s_id = f"ITEM_{s:03d}_STORE_1"
                 for h in range(1, 29):
-                    # Dev origin O0636
                     records.append({
                         "id": s_id, "item_id": f"ITEM_{s:03d}", "dept_id": "DEPT_1",
                         "cat_id": "CAT_1", "store_id": "STORE_1", "state_id": "CA",
@@ -207,7 +244,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
                         "target_units_sold": float(s), "pred_B": float(s), "pred_D": float(s + (s % 3)),
                         "abs_err_B": 0.0, "abs_err_D": float(s % 3), "err_B": 0.0, "err_D": float(s % 3),
                     })
-                    # 2015 Test origin O1735
                     records.append({
                         "id": s_id, "item_id": f"ITEM_{s:03d}", "dept_id": "DEPT_1",
                         "cat_id": "CAT_1", "store_id": "STORE_1", "state_id": "CA",
@@ -220,7 +256,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
             df_orig = pd.DataFrame(records)
             ranked_orig, _, _ = evaluate_sku_attention_rule(df_orig, tmp_path / "run1", top_k=3, log=lambda m: None)
             
-            # Perturb 2015 observed labels and predictions completely
             df_perturbed = df_orig.copy()
             test_mask = df_perturbed["fold_id"] == "FINAL_TEST"
             df_perturbed.loc[test_mask, "target_units_sold"] = df_perturbed.loc[test_mask, "target_units_sold"] * 50.0 + 1000.0
@@ -229,72 +264,299 @@ class TestChronologicalIntegrity(unittest.TestCase):
             
             ranked_pert, _, _ = evaluate_sku_attention_rule(df_perturbed, tmp_path / "run2", top_k=3, log=lambda m: None)
             
-            # Verify ranking and dev scores are 100% invariant
             pd.testing.assert_series_equal(ranked_orig["id"], ranked_pert["id"])
             pd.testing.assert_series_equal(ranked_orig["forecast_disagreement"], ranked_pert["forecast_disagreement"])
             pd.testing.assert_series_equal(ranked_orig["attention_rank"], ranked_pert["attention_rank"])
             pd.testing.assert_series_equal(ranked_orig["in_top_50"], ranked_pert["in_top_50"])
 
-    def test_matrix_bcd_coordinate_alignment(self):
-        """Test 4: Assert B and C/D feature matrices align on SKU-store, origin, horizon,
-        and target day before combination.
+    def test_production_bcd_feature_assembly_coordinate_misorder(self):
+        """Test 5: Exercise the production B/C/D feature assembly in load_partition_subset
+        with deliberately misordered coordinates. Must fail on coordinate mismatch.
         """
-        df_B = pd.DataFrame({
-            "id": ["s1", "s1", "s2", "s2"],
-            "origin_id": ["O1", "O1", "O1", "O1"],
-            "h": [1, 2, 1, 2],
-            "target_d": [101, 102, 101, 102],
-            "feat_B": [10, 20, 30, 40],
-        })
-        
-        # Valid matching C extra
-        df_C_valid = pd.DataFrame({
-            "id": ["s1", "s1", "s2", "s2"],
-            "origin_id": ["O1", "O1", "O1", "O1"],
-            "h": [1, 2, 1, 2],
-            "target_d": [101, 102, 101, 102],
-            "ph_christmas": pd.Categorical(["outside", "day_0", "outside", "day_0"], categories=PHASE_CATEGORIES),
-        })
-        
-        # Alignment assertion passes
-        self.assertEqual(len(df_B), len(df_C_valid))
-        self.assertTrue((df_B["id"].to_numpy() == df_C_valid["id"].to_numpy()).all())
-        self.assertTrue((df_B["origin_id"].to_numpy() == df_C_valid["origin_id"].to_numpy()).all())
-        self.assertTrue((df_B["h"].to_numpy() == df_C_valid["h"].to_numpy()).all())
-        self.assertTrue((df_B["target_d"].to_numpy() == df_C_valid["target_d"].to_numpy()).all())
-        
-        # Combined D
-        df_D = pd.concat([df_B, df_C_valid[["ph_christmas"]]], axis=1)
-        self.assertEqual(len(df_D), 4)
-        self.assertIn("ph_christmas", df_D.columns)
-        
-        # Length mismatch triggers assertion failure
-        df_C_bad_len = df_C_valid.iloc[:3]
-        with self.assertRaises(AssertionError):
-            assert len(df_B) == len(df_C_bad_len)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mat_B_dir = tmp_path / "matrix_B"
+            mat_C_dir = tmp_path / "matrix_C"
+            mat_D_dir = tmp_path / "matrix_D"
+            (mat_B_dir / "origin_id=O001").mkdir(parents=True)
+            (mat_C_dir / "origin_id=O001").mkdir(parents=True)
             
-        # ID order mismatch triggers assertion failure
-        df_C_bad_id = df_C_valid.copy()
-        df_C_bad_id.loc[0, "id"] = "s99"
-        with self.assertRaises(AssertionError):
-            assert (df_B["id"].to_numpy() == df_C_bad_id["id"].to_numpy()).all()
+            # Base Matrix B for two series and two horizons
+            df_B = pd.DataFrame({
+                "id": ["s1", "s1", "s2", "s2"],
+                "origin_id": ["O001", "O001", "O001", "O001"],
+                "origin_d": [100, 100, 100, 100],
+                "origin_date": ["2012-01-01"] * 4,
+                "h": [1, 2, 1, 2],
+                "target_d": [101, 102, 101, 102],
+                "target_date": ["2012-01-02", "2012-01-03", "2012-01-02", "2012-01-03"],
+                "target_units_sold": [1.0, 2.0, 3.0, 4.0],
+                "cat_id": ["FOODS"] * 4,
+                "feat_B": [10, 20, 30, 40],
+            })
+            pq.write_table(pa.Table.from_pandas(df_B), mat_B_dir / "origin_id=O001" / "data.parquet")
+            
+            cfg = ModelConfig(matrix_B_dir=mat_B_dir, matrix_C_dir=mat_C_dir)
+            sampled = {"s1", "s2"}
+            
+            # 1. Aligned Matrix C -> Production assembly succeeds
+            df_C_aligned = pd.DataFrame({
+                "id": ["s1", "s1", "s2", "s2"],
+                "h": [1, 2, 1, 2],
+                "target_d": [101, 102, 101, 102],
+                "ph_christmas": ["outside", "day_0", "outside", "day_0"],
+            })
+            pq.write_table(pa.Table.from_pandas(df_C_aligned), mat_C_dir / "origin_id=O001" / "data.parquet")
+            
+            loaded_df, coords_df, feature_cols, _ = load_partition_subset(
+                matrix_dir=mat_D_dir,
+                origin_ids=["O001"],
+                sampled_ids=sampled,
+                cfg=cfg,
+                matrix_name="model_D",
+            )
+            self.assertEqual(len(loaded_df), 4)
+            self.assertIn("ph_christmas", feature_cols)
+            
+            # 2. Deliberately misordered ID coordinates in Matrix C -> Production assembly must raise AssertionError
+            df_C_bad_id = pd.DataFrame({
+                "id": ["s2", "s2", "s1", "s1"],  # Inverted series order!
+                "h": [1, 2, 1, 2],
+                "target_d": [101, 102, 101, 102],
+                "ph_christmas": ["outside", "day_0", "outside", "day_0"],
+            })
+            pq.write_table(pa.Table.from_pandas(df_C_bad_id), mat_C_dir / "origin_id=O001" / "data.parquet")
+            with self.assertRaises(AssertionError) as ctx:
+                load_partition_subset(
+                    matrix_dir=mat_D_dir,
+                    origin_ids=["O001"],
+                    sampled_ids=sampled,
+                    cfg=cfg,
+                    matrix_name="model_D",
+                )
+            self.assertIn("Coordinate mismatch on 'id'", str(ctx.exception))
+            
+            # 3. Deliberately misordered Horizon coordinates in Matrix C -> Production assembly must raise AssertionError
+            df_C_bad_h = pd.DataFrame({
+                "id": ["s1", "s1", "s2", "s2"],
+                "h": [2, 1, 2, 1],  # Inverted horizon order!
+                "target_d": [101, 102, 101, 102],
+                "ph_christmas": ["outside", "day_0", "outside", "day_0"],
+            })
+            pq.write_table(pa.Table.from_pandas(df_C_bad_h), mat_C_dir / "origin_id=O001" / "data.parquet")
+            with self.assertRaises(AssertionError) as ctx:
+                load_partition_subset(
+                    matrix_dir=mat_D_dir,
+                    origin_ids=["O001"],
+                    sampled_ids=sampled,
+                    cfg=cfg,
+                    matrix_name="model_D",
+                )
+            self.assertIn("Coordinate mismatch on 'h'", str(ctx.exception))
+            
+            # 4. Deliberately misordered target_d coordinates in Matrix C -> Production assembly must raise AssertionError
+            df_C_bad_target = pd.DataFrame({
+                "id": ["s1", "s1", "s2", "s2"],
+                "h": [1, 2, 1, 2],
+                "target_d": [102, 101, 102, 101],  # Inverted target day order!
+                "ph_christmas": ["outside", "day_0", "outside", "day_0"],
+            })
+            pq.write_table(pa.Table.from_pandas(df_C_bad_target), mat_C_dir / "origin_id=O001" / "data.parquet")
+            with self.assertRaises(AssertionError) as ctx:
+                load_partition_subset(
+                    matrix_dir=mat_D_dir,
+                    origin_ids=["O001"],
+                    sampled_ids=sampled,
+                    cfg=cfg,
+                    matrix_name="model_D",
+                )
+            self.assertIn("Coordinate mismatch on 'target_d'", str(ctx.exception))
+
+    def test_population_accounting_disjointness_and_coverage(self):
+        """Test 6: Verify the groups are disjoint and cover every 2015-active series exactly once,
+        and sampled inactive series are reported separately.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            
+            # Create synthetic data with 4 series:
+            # - s1: in dev, will be Top-1 (Group 1)
+            # - s2: in dev, will be Rank 2 (Group 2)
+            # - s3: NOT in dev, active in 2015 (Group 3: late introduction)
+            # - s4: NOT in dev, NOT active in 2015 (Inactive)
+            records = []
+            
+            # Dev holiday origin O0636 (s1, s2 present; s3, s4 absent)
+            for h in range(1, 29):
+                records.append({
+                    "id": "s1", "item_id": "i1", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "DEV_S2012", "origin_id": "O0636", "origin_d": 636, "h": h,
+                    "target_d": 636 + h, "target_date": "2012-10-15",
+                    "target_units_sold": 10.0, "pred_B": 5.0, "pred_D": 10.0,  # diff = 5.0 * 28 = 140
+                    "abs_err_B": 5.0, "abs_err_D": 0.0, "err_B": -5.0, "err_D": 0.0,
+                })
+                records.append({
+                    "id": "s2", "item_id": "i2", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "DEV_S2012", "origin_id": "O0636", "origin_d": 636, "h": h,
+                    "target_d": 636 + h, "target_date": "2012-10-15",
+                    "target_units_sold": 2.0, "pred_B": 2.0, "pred_D": 2.5,  # diff = 0.5 * 28 = 14
+                    "abs_err_B": 0.0, "abs_err_D": 0.5, "err_B": 0.0, "err_D": 0.5,
+                })
+                
+            # 2015 Test holiday origin O1735 (s1, s2, s3 present; s4 absent)
+            for h in range(1, 29):
+                records.append({
+                    "id": "s1", "item_id": "i1", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 10.0, "pred_B": 6.0, "pred_D": 8.0,
+                    "abs_err_B": 4.0, "abs_err_D": 2.0, "err_B": -4.0, "err_D": -2.0,
+                })
+                records.append({
+                    "id": "s2", "item_id": "i2", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 3.0, "pred_B": 2.0, "pred_D": 4.0,
+                    "abs_err_B": 1.0, "abs_err_D": 1.0, "err_B": -1.0, "err_D": 1.0,
+                })
+                records.append({
+                    "id": "s3", "item_id": "i3", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 5.0, "pred_B": 3.0, "pred_D": 7.0,
+                    "abs_err_B": 2.0, "abs_err_D": 2.0, "err_B": -2.0, "err_D": 2.0,
+                })
+                
+            # s4 is only in an ordinary non-holiday origin O1885
+            for h in range(1, 29):
+                records.append({
+                    "id": "s4", "item_id": "i4", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1885", "origin_d": 1885, "h": h,
+                    "target_d": 1885 + h, "target_date": "2016-03-15",
+                    "target_units_sold": 1.0, "pred_B": 1.0, "pred_D": 1.0,
+                    "abs_err_B": 0.0, "abs_err_D": 0.0, "err_B": 0.0, "err_D": 0.0,
+                })
+                
+            df = pd.DataFrame(records)
+            ranked, top_k_df, md_report = evaluate_sku_attention_rule(df, tmp_path, top_k=1, log=lambda m: None)
+            
+            # Verify 4 series in ranked table
+            self.assertEqual(len(ranked), 4)
+            
+            # Group assignments
+            g1 = set(ranked[ranked["population_group"] == "TOP_50_REVIEW"]["id"])
+            g2 = set(ranked[ranked["population_group"] == "OTHER_DEV_RANKED"]["id"])
+            g3 = set(ranked[ranked["population_group"] == "UNRANKED_ACTIVE_2015"]["id"])
+            ginact = set(ranked[ranked["population_group"] == "INACTIVE_2015_HOLIDAY"]["id"])
+            
+            self.assertEqual(g1, {"s1"})
+            self.assertEqual(g2, {"s2"})
+            self.assertEqual(g3, {"s3"})
+            self.assertEqual(ginact, {"s4"})
+            
+            # Disjointness
+            self.assertEqual(len(g1 & g2), 0)
+            self.assertEqual(len(g1 & g3), 0)
+            self.assertEqual(len(g2 & g3), 0)
+            self.assertEqual(len(g1 & ginact), 0)
+            self.assertEqual(len(g2 & ginact), 0)
+            self.assertEqual(len(g3 & ginact), 0)
+            
+            # Exhaustiveness
+            self.assertEqual(g1 | g2 | g3, {"s1", "s2", "s3"})
+            self.assertEqual(g1 | g2 | g3 | ginact, {"s1", "s2", "s3", "s4"})
+            
+            # Policy defaults
+            self.assertEqual(ranked.loc[ranked["id"] == "s1", "policy_default"].iloc[0], "HUMAN_REVIEW_TRIAGE")
+            self.assertEqual(ranked.loc[ranked["id"] == "s2", "policy_default"].iloc[0], "MODEL_B_DEFAULT")
+            self.assertEqual(ranked.loc[ranked["id"] == "s3", "policy_default"].iloc[0], "MODEL_B_DEFAULT")
+            self.assertEqual(ranked.loc[ranked["id"] == "s4", "policy_default"].iloc[0], "INACTIVE")
+
+    def test_group_row_counts_and_weighted_mae_reproduction(self):
+        """Test 7: Verify group row counts sum to all-active row count and their weighted errors
+        reproduce all-active MAE.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            
+            records = []
+            # Dev holiday origin O0636
+            for h in range(1, 29):
+                records.append({
+                    "id": "s1", "item_id": "i1", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "DEV_S2012", "origin_id": "O0636", "origin_d": 636, "h": h,
+                    "target_d": 636 + h, "target_date": "2012-10-15",
+                    "target_units_sold": 5.0, "pred_B": 1.0, "pred_D": 5.0,
+                    "abs_err_B": 4.0, "abs_err_D": 0.0, "err_B": -4.0, "err_D": 0.0,
+                })
+                records.append({
+                    "id": "s2", "item_id": "i2", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "DEV_S2012", "origin_id": "O0636", "origin_d": 636, "h": h,
+                    "target_d": 636 + h, "target_date": "2012-10-15",
+                    "target_units_sold": 2.0, "pred_B": 2.0, "pred_D": 2.1,
+                    "abs_err_B": 0.0, "abs_err_D": 0.1, "err_B": 0.0, "err_D": 0.1,
+                })
+                
+            # 2015 Test holiday origin O1735 (s1, s2, and unranked s3)
+            for h in range(1, 29):
+                records.append({
+                    "id": "s1", "item_id": "i1", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 8.0, "pred_B": 4.0, "pred_D": 6.0,
+                    "abs_err_B": 4.0, "abs_err_D": 2.0, "err_B": -4.0, "err_D": -2.0,
+                })
+                records.append({
+                    "id": "s2", "item_id": "i2", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 3.0, "pred_B": 2.0, "pred_D": 2.5,
+                    "abs_err_B": 1.0, "abs_err_D": 0.5, "err_B": -1.0, "err_D": -0.5,
+                })
+                records.append({
+                    "id": "s3", "item_id": "i3", "dept_id": "d1", "cat_id": "c1", "store_id": "st1", "state_id": "CA",
+                    "fold_id": "FINAL_TEST", "origin_id": "O1735", "origin_d": 1735, "h": h,
+                    "target_d": 1735 + h, "target_date": "2015-10-15",
+                    "target_units_sold": 6.0, "pred_B": 3.0, "pred_D": 9.0,
+                    "abs_err_B": 3.0, "abs_err_D": 3.0, "err_B": -3.0, "err_D": 3.0,
+                })
+                
+            df = pd.DataFrame(records)
+            evaluate_sku_attention_rule(df, tmp_path, top_k=1, log=lambda m: None)
+            
+            # Read sensitivity table
+            sens_df = pd.read_csv(tmp_path / "sku_attention_unique_date_sensitivity.csv")
+            default_sens = sens_df[sens_df["eval_level"] == "Origin-Horizon (Default)"]
+            
+            g1_row = default_sens[default_sens["segment"].str.contains("Top-1")].iloc[0]
+            g2_row = default_sens[default_sens["segment"].str.contains("Other Development")].iloc[0]
+            g3_row = default_sens[default_sens["segment"].str.contains("2015-Active Series")].iloc[0]
+            all_row = default_sens[default_sens["segment"].str.contains("All Active")].iloc[0]
+            
+            # Row sum verification
+            self.assertEqual(g1_row["n_predictions"] + g2_row["n_predictions"] + g3_row["n_predictions"], all_row["n_predictions"])
+            self.assertEqual(all_row["n_predictions"], 84)
+            
+            # Series sum verification
+            self.assertEqual(g1_row["n_series"] + g2_row["n_series"] + g3_row["n_series"], all_row["n_series"])
+            self.assertEqual(all_row["n_series"], 3)
+            
+            # Weighted MAE verification
+            expected_B = (g1_row["mae_B"] * g1_row["n_predictions"] + g2_row["mae_B"] * g2_row["n_predictions"] + g3_row["mae_B"] * g3_row["n_predictions"]) / all_row["n_predictions"]
+            expected_D = (g1_row["mae_D"] * g1_row["n_predictions"] + g2_row["mae_D"] * g2_row["n_predictions"] + g3_row["mae_D"] * g3_row["n_predictions"]) / all_row["n_predictions"]
+            self.assertAlmostEqual(all_row["mae_B"], expected_B, places=6)
+            self.assertAlmostEqual(all_row["mae_D"], expected_D, places=6)
 
     def test_training_price_normalization_zero_lookahead(self):
-        """Test 5: Category price median is computed strictly from training origins
+        """Test 8: Category price median is computed strictly from training origins
         and applied to validation origins without look-ahead or contamination from future prices.
         """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        from m5_models.config import ModelConfig
-        from m5_models.data import compute_fold_category_median_prices, load_partition_subset
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             mat_A = tmp_path / "matrix_A"
             (mat_A / "origin_id=O001").mkdir(parents=True)
             (mat_A / "origin_id=O002").mkdir(parents=True)
 
-            # Training origin O001 has prices 2.0 and 4.0 for FOODS -> median = 3.0
             df_train = pd.DataFrame({
                 "id": ["s1", "s2"], "cat_id": ["FOODS", "FOODS"],
                 "last_price_known_at_origin": [2.0, 4.0],
@@ -304,7 +566,6 @@ class TestChronologicalIntegrity(unittest.TestCase):
             })
             pq.write_table(pa.Table.from_pandas(df_train), mat_A / "origin_id=O001" / "data.parquet")
 
-            # Validation origin O002 has prices 100.0 and 200.0 (future inflation/spike)
             df_val = pd.DataFrame({
                 "id": ["s1", "s2"], "cat_id": ["FOODS", "FOODS"],
                 "last_price_known_at_origin": [99.0, 150.0],
@@ -317,16 +578,13 @@ class TestChronologicalIntegrity(unittest.TestCase):
             cfg = ModelConfig(matrix_A_dir=mat_A)
             sampled = {"s1", "s2"}
 
-            # Compute median using training origin O001 ONLY
             train_medians = compute_fold_category_median_prices(["O001"], sampled, cfg)
             self.assertEqual(train_medians["FOODS"], 3.0)
 
-            # Load validation origin O002 using frozen train medians
             df_val_loaded, _, _, _ = load_partition_subset(
                 mat_A, ["O002"], sampled, cfg, fold_cat_medians=train_medians
             )
 
-            # Verify that validation origin was normalized by training median (3.0), NOT validation median
             expected_ratios = np.array([99.0 / 3.0, 150.0 / 3.0], dtype=np.float32)
             actual_ratios = df_val_loaded["price_ratio_to_cat_median"].to_numpy()
             np.testing.assert_allclose(actual_ratios, expected_ratios, rtol=1e-5)
@@ -334,4 +592,3 @@ class TestChronologicalIntegrity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

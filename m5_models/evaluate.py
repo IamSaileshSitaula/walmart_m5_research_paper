@@ -182,6 +182,11 @@ def predict_evaluation_origins(
                 c_extra = [c for c in fold_day_C.columns if c.startswith("ph_") or c.startswith("k_") or c.startswith("n_fam_") or c.startswith("span_")]
                 df_C_extra = day_C_indexed[c_extra].loc[df_B["target_d"]].reset_index(drop=True)
             else:
+                for coord in ["id", "h", "target_d"]:
+                    if coord in df_C.columns and coord in df_B.columns:
+                        assert (df_B[coord].to_numpy() == df_C[coord].to_numpy()).all(), (
+                            f"Coordinate mismatch on '{coord}' between Matrix B and Matrix C in origin {orig_id}"
+                        )
                 c_extra = [c for c in df_C.columns if c.startswith("ph_") or c.startswith("k_")]
                 df_C_extra = df_C[c_extra].reset_index(drop=True)
             

@@ -109,8 +109,10 @@ To avoid pseudo-replication from treating dependent SKU rows around the same hol
 
 > [!NOTE]
 > Detailed audit and SKU-by-SKU outcomes are saved in [sku_attention_report.md](file:///outputs/m5_models/sku_attention_report.md).
-- **Calibration Scope**: Calibrated strictly on development holiday origins (`DEV_S2012`–`DEV_S2014`) by ranking 28-day cumulative forecast disagreement between Model B and Model D.
+- **Calibration Scope**: Calibrated strictly on development holiday origins (DEV_S2012–DEV_S2014) by ranking 28-day cumulative forecast disagreement between Model B and Model D.
 - **Operational Meaning**: The score measures forecast-implied 28-day order quantity difference / forecast disagreement, NOT actual inventory orders.
 - **Review List Capacity**: Fixed at Top 50 highest-disagreement SKU-store pairs (1.6% of series).
+- **Mutually Exclusive Population Accounting**: Partitions the 3,046 2015-active holiday series into (1) Top-50 development-ranked review list (50 series; 14,000 rows), (2) Other development-ranked series (2,904 series; 813,120 rows), and (3) 2015-active unranked late introductions (92 series; 25,200 rows; Model B baseline default). An additional 4 sampled series were inactive during 2015 holiday origins (3,050 total).
+- **Review Policy Meaning**: A top-50 flag identifies substantial disagreement between Model B and Model D; it does NOT authorize switching to Model D. The unranked group's Model B fallback is a prospective policy definition for subsequent inventory simulation, not a claim that Model B increased profit.
 - **Exploratory 2015 Evaluation**: Because 2015 results were previously inspected, this analysis is strictly EXPLORATORY. Model D is NOT automatically superior for flagged SKUs; disagreement flags SKUs for closer human review.
 - **No Premature Inventory Claims**: No claim is made that the attention rule increases profit or reduces stockouts; those operational outcomes require a downstream inventory simulation.

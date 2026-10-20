@@ -107,9 +107,20 @@ def load_partition_subset(
                 if not p_C.exists():
                     continue
                 pf_C = pq.ParquetFile(p_C)
+                coord_cols = [c for c in ["id", "h", "target_d"] if c in pf_C.schema.names]
                 c_extra = [c for c in pf_C.schema.names if c.startswith("ph_") or c.startswith("k_")]
-                df_C_extra = pf_C.read(columns=c_extra).to_pandas()
-                df_C_sub = df_C_extra[b_mask].reset_index(drop=True)
+                df_C_raw = pf_C.read(columns=coord_cols + c_extra).to_pandas()
+                df_C_sub = df_C_raw[b_mask].reset_index(drop=True)
+                
+                assert len(df_B_sub) == len(df_C_sub), (
+                    f"Row count mismatch between B ({len(df_B_sub)}) and C ({len(df_C_sub)}) for origin {orig_id}"
+                )
+                for coord in ["id", "h", "target_d"]:
+                    if coord in df_C_sub.columns and coord in df_B_sub.columns:
+                        assert (df_B_sub[coord].to_numpy() == df_C_sub[coord].to_numpy()).all(), (
+                            f"Coordinate mismatch on '{coord}' between Matrix B and Matrix C for origin {orig_id}"
+                        )
+                df_C_sub = df_C_sub[c_extra]
             
             assert len(df_B_sub) == len(df_C_sub), (
                 f"Row count mismatch between B ({len(df_B_sub)}) and C ({len(df_C_sub)}) for origin {orig_id}"
@@ -124,11 +135,15 @@ def load_partition_subset(
             a_mask = df_A["id"].isin(sampled_ids).to_numpy()
             df_sub_base = df_A[a_mask].reset_index(drop=True)
             
-            df_B_events = pq.ParquetFile(p_B).read(columns=["id", "t_event_count", "t_no_event"]).to_pandas()
+            pf_B = pq.ParquetFile(p_B)
+            coord_cols_B = [c for c in ["id", "h", "target_d"] if c in pf_B.schema.names]
+            df_B_events = pf_B.read(columns=coord_cols_B + ["t_event_count", "t_no_event"]).to_pandas()
             df_B_sub_ev = df_B_events[a_mask].reset_index(drop=True)
-            assert (df_sub_base["id"].to_numpy() == df_B_sub_ev["id"].to_numpy()).all(), (
-                f"ID mismatch between A and B for origin {orig_id}"
-            )
+            for coord in ["id", "h", "target_d"]:
+                if coord in df_sub_base.columns and coord in df_B_sub_ev.columns:
+                    assert (df_sub_base[coord].to_numpy() == df_B_sub_ev[coord].to_numpy()).all(), (
+                        f"Coordinate mismatch on '{coord}' between Matrix A and Matrix B for origin {orig_id}"
+                    )
             df_sub_base["t_event_count"] = df_B_sub_ev["t_event_count"].to_numpy()
             df_sub_base["t_no_event"] = df_B_sub_ev["t_no_event"].to_numpy()
             

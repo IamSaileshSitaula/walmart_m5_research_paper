@@ -1,13 +1,19 @@
 """SKU Attention Rule: Development Ranking, Decision Difference, and 2015 Exploratory Evaluation.
 
-Governed by chronological integrity:
+Governed by chronological integrity and rigorous population accounting:
 1. Holiday-relevant origins are identified strictly using calendar dates (Thanksgiving and Christmas analysis windows).
-2. For each eligible SKU-store/origin pair, all 28 horizons (h = 1..28) are summed.
+2. For each eligible SKU-store/origin pair, all 28 horizons (h = 1..28) are verified (duplicate and missing horizons strictly prohibited) and summed.
 3. Decision difference = |Q_D - Q_B|, where Q = sum_{h=1..28}(pred_h).
 4. Ranking is calibrated strictly on historical development holiday origins (2012-2014).
 5. 2015 evaluation is designated as EXPLORATORY (not untouched confirmatory).
-6. Disagreement is an informational signal for managerial triage, NOT proof that Model D is superior
+6. Disagreement is an informational signal for managerial triage, NOT proof that Model D is superior,
    and NOT an actual inventory order.
+7. Population accounting partitions the 2015-active series into mutually exclusive and exhaustive groups:
+   - Group 1: Top-50 development-ranked series: flagged for human review.
+   - Group 2: Other development-ranked series: not flagged.
+   - Group 3: 2015-active series without a development score: not eligible for historical ranking;
+              use Model B as explicit default for downstream inventory simulation.
+   Sampled series with no 2015 holiday evaluation (inactive) are accounted for separately.
 """
 from __future__ import annotations
 
@@ -62,13 +68,48 @@ def get_holiday_relevant_origins(
     return hol_origs
 
 
+def verify_horizon_integrity(df: pd.DataFrame, context_name: str = "predictions") -> None:
+    """Verify that each eligible (id, origin_id) pair contains each horizon 1..28 exactly once.
+    
+    A duplicate horizon or a missing horizon must fail.
+    """
+    if df.duplicated(subset=["id", "origin_id", "h"]).any():
+        dups = df[df.duplicated(subset=["id", "origin_id", "h"], keep=False)]
+        example_dup = dups[["id", "origin_id", "h"]].head()
+        raise ValueError(
+            f"Horizon integrity failed in {context_name}: Duplicate (id, origin_id, h) detected! "
+            f"Examples:\n{example_dup}"
+        )
+    
+    h_stats = df.groupby(["id", "origin_id"], observed=True)["h"].agg(["count", "nunique", "min", "max"])
+    incomplete = h_stats[
+        (h_stats["count"] != 28) |
+        (h_stats["nunique"] != 28) |
+        (h_stats["min"] != 1) |
+        (h_stats["max"] != 28)
+    ]
+    if len(incomplete) > 0:
+        raise ValueError(
+            f"Horizon integrity failed in {context_name}: {len(incomplete)} (id, origin_id) pairs "
+            f"do not contain each horizon 1..28 exactly once! Examples:\n{incomplete.head()}"
+        )
+
+
 def evaluate_sku_attention_rule(
     full_preds_df: pd.DataFrame,
     out_dir: Path,
     top_k: int = 50,
     log: callable = print,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Calibrate SKU attention ranking strictly on development holiday origins and evaluate on 2015."""
+    """Calibrate SKU attention ranking strictly on development holiday origins and evaluate on 2015.
+    
+    Partitions the 2015-active population into three mutually exclusive and exhaustive groups:
+    1. Top-50 development-ranked series: flagged for human review.
+    2. Other development-ranked series: not flagged.
+    3. 2015-active series without a development score: not eligible for historical ranking;
+       Model B default.
+    Sampled series with no 2015 holiday evaluation are reported separately.
+    """
     log("Building and evaluating SKU attention rule (forecast-implied 28-day order quantity disagreement)...")
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -95,15 +136,10 @@ def evaluate_sku_attention_rule(
     if len(dev_df) == 0:
         raise ValueError("No development predictions found for identified holiday origins.")
         
-    # Verify that each eligible (series, origin) pair has exactly 28 forecast horizons
-    h_per_pair = dev_df.groupby(["id", "origin_id"], observed=True)["h"].agg(["count", "min", "max"])
-    incomplete = h_per_pair[(h_per_pair["count"] != 28) | (h_per_pair["min"] != 1) | (h_per_pair["max"] != 28)]
-    if len(incomplete) > 0:
-        raise ValueError(
-            f"Integrity check failed: {len(incomplete)} (series, origin) pairs have incomplete horizons! "
-            f"Example: {incomplete.head()}"
-        )
-    log(f"  Horizon integrity verified: All {len(h_per_pair):,} series-origin pairs in development contain exactly h = 1..28.")
+    # Strictly require each eligible (id, origin_id) pair to contain each horizon 1..28 exactly once
+    verify_horizon_integrity(dev_df, "development holiday predictions")
+    n_dev_pairs = dev_df.groupby(["id", "origin_id"], observed=True).ngroups
+    log(f"  Horizon integrity verified: All {n_dev_pairs:,} series-origin pairs in development contain exactly h = 1..28.")
     
     # -------------------------------------------------------------------------
     # 3. Calculate 28-Day Cumulative Forecast Disagreement per Series-Origin
@@ -133,40 +169,119 @@ def evaluate_sku_attention_rule(
     dev_attention_score["attention_rank"] = np.arange(1, len(dev_attention_score) + 1)
     dev_attention_score["in_top_50"] = dev_attention_score["attention_rank"] <= top_k
     
-    # Attach static hierarchy metadata
-    static_cols = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
-    series_meta = dev_df[static_cols].drop_duplicates("id")
-    dev_ranked = dev_attention_score.merge(series_meta, on="id", how="left")
-    
-    # Also attach development row-level MAEs
+    # Attach development row-level MAEs
     dev_row_mae = dev_df.groupby("id", observed=True).agg(
         dev_mae_B=("abs_err_B", "mean"),
         dev_mae_D=("abs_err_D", "mean"),
     ).reset_index()
-    dev_ranked = dev_ranked.merge(dev_row_mae, on="id", how="left")
+    dev_ranked = dev_attention_score.merge(dev_row_mae, on="id", how="left")
     dev_ranked["dev_delta_mae"] = dev_ranked["dev_mae_D"] - dev_ranked["dev_mae_B"]
     
-    log(f"  Development ranking completed: Top {top_k} review list identified from {len(dev_ranked):,} candidate series.")
+    log(f"  Development ranking completed: Top {top_k} review list identified from {len(dev_ranked):,} eligible development series.")
     
     # -------------------------------------------------------------------------
     # 4. Evaluate on 2015 Test Holiday Origins (Exploratory Evaluation)
     # -------------------------------------------------------------------------
     test_df = full_preds_df[full_preds_df["origin_id"].isin(test_hol_origs)].copy()
     
-    # Validate 28 horizons on 2015 origins
-    test_h_per_pair = test_df.groupby(["id", "origin_id"], observed=True)["h"].agg(["count", "min", "max"])
-    test_incomplete = test_h_per_pair[(test_h_per_pair["count"] != 28) | (test_h_per_pair["min"] != 1) | (test_h_per_pair["max"] != 28)]
-    if len(test_incomplete) > 0:
-        raise ValueError(f"Integrity check failed: {len(test_incomplete)} test pairs have incomplete horizons!")
-        
-    test_series = set(test_df["id"].unique())
-    n_study_series = 3050
-    n_test_active = len(test_series)
-    n_test_inactive = n_study_series - n_test_active
+    # Strictly require each eligible (id, origin_id) pair in 2015 to contain each horizon 1..28 exactly once
+    verify_horizon_integrity(test_df, "2015 test holiday predictions")
+    n_test_pairs = test_df.groupby(["id", "origin_id"], observed=True).ngroups
+    log(f"  Horizon integrity verified: All {n_test_pairs:,} series-origin pairs in 2015 test contain exactly h = 1..28.")
     
-    log(f"  2015 test holiday origins: {n_test_active:,}/{n_study_series:,} series active ({n_test_inactive} inactive/late-introduced).")
+    # -------------------------------------------------------------------------
+    # 5. Mutually Exclusive & Exhaustive Population Accounting
+    # -------------------------------------------------------------------------
+    all_study_series = set(full_preds_df["id"].unique())
+    n_study_series = len(all_study_series)
+    dev_ranked_ids = set(dev_ranked["id"])
+    top_k_ids = set(dev_ranked[dev_ranked["in_top_50"]]["id"])
+    other_dev_ids = dev_ranked_ids - top_k_ids
+    test_active_ids = set(test_df["id"].unique())
     
-    # Per-series 2015 test accuracy metrics
+    # Group 1: Top-50 development-ranked series (flagged for review)
+    g1_ids = top_k_ids & test_active_ids
+    # Group 2: Other development-ranked series (unflagged)
+    g2_ids = other_dev_ids & test_active_ids
+    # Group 3: 2015-active series without a development score (late introductions; Model B default)
+    g3_ids = test_active_ids - dev_ranked_ids
+    # Sampled series with no 2015 holiday evaluation (inactive/unobserved)
+    inactive_study_ids = all_study_series - test_active_ids
+    
+    # Rigorous disjointness and completeness assertions
+    assert len(g1_ids & g2_ids) == 0, f"Disjointness violated: G1 and G2 overlap ({len(g1_ids & g2_ids)} series)!"
+    assert len(g1_ids & g3_ids) == 0, f"Disjointness violated: G1 and G3 overlap ({len(g1_ids & g3_ids)} series)!"
+    assert len(g2_ids & g3_ids) == 0, f"Disjointness violated: G2 and G3 overlap ({len(g2_ids & g3_ids)} series)!"
+    assert (g1_ids | g2_ids | g3_ids) == test_active_ids, (
+        f"Exhaustiveness violated: Active groups sum to {len(g1_ids | g2_ids | g3_ids)}, expected {len(test_active_ids)}!"
+    )
+    assert len(test_active_ids & inactive_study_ids) == 0, "Disjointness violated: Active and inactive series overlap!"
+    assert (test_active_ids | inactive_study_ids) == all_study_series, (
+        f"Exhaustiveness violated: Active + inactive sum to {len(test_active_ids | inactive_study_ids)}, expected {n_study_series}!"
+    )
+    
+    n_test_active = len(test_active_ids)
+    n_test_inactive = len(inactive_study_ids)
+    
+    log(f"  Population Accounting: {n_study_series:,} total sampled series.")
+    log(f"    - Group 1 (Top-{top_k} dev-ranked review list): {len(g1_ids):,} series")
+    log(f"    - Group 2 (Other dev-ranked series, unflagged): {len(g2_ids):,} series")
+    log(f"    - Group 3 (2015-active unranked late introductions): {len(g3_ids):,} series")
+    log(f"    -> Total 2015-Active Holiday Series: {n_test_active:,} series")
+    log(f"    - Sampled Series Without 2015 Holiday Evaluation: {n_test_inactive:,} series")
+    
+    # -------------------------------------------------------------------------
+    # 6. Group Metrics and Row Count Verification
+    # -------------------------------------------------------------------------
+    rows_g1 = test_df[test_df["id"].isin(g1_ids)]
+    rows_g2 = test_df[test_df["id"].isin(g2_ids)]
+    rows_g3 = test_df[test_df["id"].isin(g3_ids)]
+    rows_all = test_df
+    
+    assert len(rows_g1) + len(rows_g2) + len(rows_g3) == len(rows_all), (
+        f"Row count mismatch: {len(rows_g1)} + {len(rows_g2)} + {len(rows_g3)} != {len(rows_all)}"
+    )
+    
+    def calc_group_metrics(sub_df: pd.DataFrame, n_series: int, name: str) -> dict:
+        n_rows = len(sub_df)
+        if n_rows == 0:
+            return {
+                "name": name, "n_series": n_series, "n_rows": 0,
+                "mae_B": 0.0, "mae_D": 0.0, "delta_mae": 0.0, "delta_pct": 0.0,
+                "rmse_B": 0.0, "rmse_D": 0.0, "bias_B": 0.0, "bias_D": 0.0,
+            }
+        m_B = float(np.mean(sub_df["abs_err_B"]))
+        m_D = float(np.mean(sub_df["abs_err_D"]))
+        r_B = float(np.sqrt(np.mean(sub_df["err_B"]**2)))
+        r_D = float(np.sqrt(np.mean(sub_df["err_D"]**2)))
+        b_B = float(np.mean(sub_df["err_B"]))
+        b_D = float(np.mean(sub_df["err_D"]))
+        d_m = m_D - m_B
+        d_pct = (d_m / m_B * 100.0) if m_B > 0 else 0.0
+        return {
+            "name": name, "n_series": n_series, "n_rows": n_rows,
+            "mae_B": m_B, "mae_D": m_D, "delta_mae": d_m, "delta_pct": d_pct,
+            "rmse_B": r_B, "rmse_D": r_D, "bias_B": b_B, "bias_D": b_D,
+        }
+    
+    m_g1 = calc_group_metrics(rows_g1, len(g1_ids), f"Top-{top_k} Development-Ranked Series (Flagged for Review)")
+    m_g2 = calc_group_metrics(rows_g2, len(g2_ids), "Other Development-Ranked Series (Unflagged)")
+    m_g3 = calc_group_metrics(rows_g3, len(g3_ids), "2015-Active Series Without Dev Score (Model B Default)")
+    m_all = calc_group_metrics(rows_all, n_test_active, "All Active 2015 Holiday Series")
+    
+    # Weighted error reconstruction check
+    weighted_mae_B = (m_g1["mae_B"] * m_g1["n_rows"] + m_g2["mae_B"] * m_g2["n_rows"] + m_g3["mae_B"] * m_g3["n_rows"]) / m_all["n_rows"]
+    weighted_mae_D = (m_g1["mae_D"] * m_g1["n_rows"] + m_g2["mae_D"] * m_g2["n_rows"] + m_g3["mae_D"] * m_g3["n_rows"]) / m_all["n_rows"]
+    assert np.isclose(weighted_mae_B, m_all["mae_B"], rtol=1e-7), (
+        f"Weighted MAE B ({weighted_mae_B:.6f}) does not match all-active MAE ({m_all['mae_B']:.6f})"
+    )
+    assert np.isclose(weighted_mae_D, m_all["mae_D"], rtol=1e-7), (
+        f"Weighted MAE D ({weighted_mae_D:.6f}) does not match all-active MAE ({m_all['mae_D']:.6f})"
+    )
+    
+    # -------------------------------------------------------------------------
+    # 7. Series-Level Statistics and Full Catalog Compilation
+    # -------------------------------------------------------------------------
     test_sku_stats = test_df.groupby("id", observed=True).agg(
         test_obs_mean=("target_units_sold", "mean"),
         test_mae_B=("abs_err_B", "mean"),
@@ -177,7 +292,6 @@ def evaluate_sku_attention_rule(
         test_bias_D=("err_D", "mean"),
         test_n_rows=("target_units_sold", "count"),
     ).reset_index()
-    
     test_sku_stats["test_delta_mae"] = test_sku_stats["test_mae_D"] - test_sku_stats["test_mae_B"]
     test_sku_stats["test_pct_improvement"] = np.where(
         test_sku_stats["test_mae_B"] > 0,
@@ -189,58 +303,53 @@ def evaluate_sku_attention_rule(
         np.where(test_sku_stats["test_delta_mae"] > 1e-5, "WORSENED", "TIED")
     )
     
-    # Combine development ranking with test outcomes
-    full_sku_ranked = dev_ranked.merge(test_sku_stats, on="id", how="left")
+    # Combine static hierarchy metadata for ALL study series
+    static_cols = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    all_series_meta = full_preds_df[static_cols].drop_duplicates("id").reset_index(drop=True)
     
-    # Save full ranked list (3,050 series)
+    full_sku_ranked = all_series_meta.merge(dev_ranked, on="id", how="left")
+    full_sku_ranked = full_sku_ranked.merge(test_sku_stats, on="id", how="left")
+    
+    def assign_population_group(row_id: str) -> str:
+        if row_id in g1_ids:
+            return "TOP_50_REVIEW"
+        elif row_id in g2_ids:
+            return "OTHER_DEV_RANKED"
+        elif row_id in g3_ids:
+            return "UNRANKED_ACTIVE_2015"
+        else:
+            return "INACTIVE_2015_HOLIDAY"
+            
+    def assign_policy_default(row_id: str) -> str:
+        if row_id in g1_ids:
+            return "HUMAN_REVIEW_TRIAGE"
+        elif row_id in g2_ids:
+            return "MODEL_B_DEFAULT"
+        elif row_id in g3_ids:
+            return "MODEL_B_DEFAULT"
+        else:
+            return "INACTIVE"
+            
+    full_sku_ranked["population_group"] = full_sku_ranked["id"].map(assign_population_group)
+    full_sku_ranked["policy_default"] = full_sku_ranked["id"].map(assign_policy_default)
+    full_sku_ranked["in_top_50"] = full_sku_ranked["id"].isin(g1_ids)
+    
+    # Sort: Top 50 first, then remaining dev ranked, then unranked active, then inactive
+    group_order = {"TOP_50_REVIEW": 1, "OTHER_DEV_RANKED": 2, "UNRANKED_ACTIVE_2015": 3, "INACTIVE_2015_HOLIDAY": 4}
+    full_sku_ranked["group_order"] = full_sku_ranked["population_group"].map(group_order)
+    full_sku_ranked = full_sku_ranked.sort_values(["group_order", "attention_rank", "id"]).drop(columns=["group_order"]).reset_index(drop=True)
+    
     ranked_csv = out_dir / "sku_attention_ranked_list.csv"
     full_sku_ranked.to_csv(ranked_csv, index=False)
     
     # Top 50 audit table
-    top_50_df = full_sku_ranked[full_sku_ranked["in_top_50"]].copy()
+    top_50_df = full_sku_ranked[full_sku_ranked["in_top_50"]].copy().sort_values("attention_rank").reset_index(drop=True)
     top_50_csv = out_dir / "sku_attention_2015_performance.csv"
     top_50_df.to_csv(top_50_csv, index=False)
     
     # -------------------------------------------------------------------------
-    # 5. Statistical Comparison: Top 50 vs Remaining vs Whole Catalog
+    # 8. Top 50 Win/Loss Outcomes and Effect Sizes
     # -------------------------------------------------------------------------
-    top50_ids = set(top_50_df["id"])
-    rest_ids = set(dev_ranked[~dev_ranked["in_top_50"]]["id"]) & test_series
-    
-    # Segment subsets
-    top50_rows = test_df[test_df["id"].isin(top50_ids)]
-    rest_rows = test_df[test_df["id"].isin(rest_ids)]
-    all_rows = test_df
-    
-    # Aggregate metrics
-    top50_mae_B = float(np.mean(top50_rows["abs_err_B"]))
-    top50_mae_D = float(np.mean(top50_rows["abs_err_D"]))
-    top50_rmse_B = float(np.sqrt(np.mean(top50_rows["err_B"]**2)))
-    top50_rmse_D = float(np.sqrt(np.mean(top50_rows["err_D"]**2)))
-    top50_bias_B = float(np.mean(top50_rows["err_B"]))
-    top50_bias_D = float(np.mean(top50_rows["err_D"]))
-    top50_delta_mae = top50_mae_D - top50_mae_B
-    top50_delta_pct = (top50_delta_mae / top50_mae_B * 100.0) if top50_mae_B > 0 else 0.0
-    
-    rest_mae_B = float(np.mean(rest_rows["abs_err_B"])) if len(rest_rows) > 0 else 0.0
-    rest_mae_D = float(np.mean(rest_rows["abs_err_D"])) if len(rest_rows) > 0 else 0.0
-    rest_rmse_B = float(np.sqrt(np.mean(rest_rows["err_B"]**2))) if len(rest_rows) > 0 else 0.0
-    rest_rmse_D = float(np.sqrt(np.mean(rest_rows["err_D"]**2))) if len(rest_rows) > 0 else 0.0
-    rest_bias_B = float(np.mean(rest_rows["err_B"])) if len(rest_rows) > 0 else 0.0
-    rest_bias_D = float(np.mean(rest_rows["err_D"])) if len(rest_rows) > 0 else 0.0
-    rest_delta_mae = rest_mae_D - rest_mae_B
-    rest_delta_pct = (rest_delta_mae / rest_mae_B * 100.0) if rest_mae_B > 0 else 0.0
-    
-    all_mae_B = float(np.mean(all_rows["abs_err_B"])) if len(all_rows) > 0 else 0.0
-    all_mae_D = float(np.mean(all_rows["abs_err_D"])) if len(all_rows) > 0 else 0.0
-    all_rmse_B = float(np.sqrt(np.mean(all_rows["err_B"]**2))) if len(all_rows) > 0 else 0.0
-    all_rmse_D = float(np.sqrt(np.mean(all_rows["err_D"]**2))) if len(all_rows) > 0 else 0.0
-    all_bias_B = float(np.mean(all_rows["err_B"])) if len(all_rows) > 0 else 0.0
-    all_bias_D = float(np.mean(all_rows["err_D"])) if len(all_rows) > 0 else 0.0
-    all_delta_mae = all_mae_D - all_mae_B
-    all_delta_pct = (all_delta_mae / all_mae_B * 100.0) if all_mae_B > 0 else 0.0
-    
-    # Top 50 win/loss/tie outcomes
     n_top50_eval = len(top_50_df[top_50_df["outcome"].notna()])
     n_improved = int((top_50_df["outcome"] == "IMPROVED").sum())
     n_worsened = int((top_50_df["outcome"] == "WORSENED").sum())
@@ -249,20 +358,17 @@ def evaluate_sku_attention_rule(
     pct_worsened = (n_worsened / n_top50_eval) * 100.0 if n_top50_eval > 0 else 0.0
     pct_tied = (n_tied / n_top50_eval) * 100.0 if n_top50_eval > 0 else 0.0
     
-    # Effect size calculations across Top 50 series
     sku_deltas = top_50_df["test_delta_mae"].dropna().to_numpy()
     mean_sku_delta = float(np.mean(sku_deltas)) if len(sku_deltas) > 0 else 0.0
     std_sku_delta = float(np.std(sku_deltas, ddof=1)) if len(sku_deltas) > 1 else 0.0
     cohen_d = (mean_sku_delta / std_sku_delta) if std_sku_delta > 0 else 0.0
     
-    # Paired t-test
     if len(sku_deltas) > 1 and std_sku_delta > 0:
         t_stat = mean_sku_delta / (std_sku_delta / np.sqrt(len(sku_deltas)))
         p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=len(sku_deltas) - 1)))
     else:
         t_stat, p_val = np.nan, np.nan
         
-    # Wilcoxon signed-rank test on SKU MAEs
     w_stat, w_pval = np.nan, np.nan
     if len(sku_deltas) > 10 and not (top_50_df["test_mae_D"] == top_50_df["test_mae_B"]).all():
         try:
@@ -273,12 +379,10 @@ def evaluate_sku_attention_rule(
             w_stat, w_pval = float(w_res.statistic), float(w_res.pvalue)
         except Exception:
             w_stat, w_pval = np.nan, np.nan
-    
+            
     # -------------------------------------------------------------------------
-    # 6. Unique Target Date Sensitivity Analysis
+    # 9. Unique Target Date Sensitivity Analysis
     # -------------------------------------------------------------------------
-    # Because rolling origins step weekly, multiple origins evaluate the same target dates.
-    # Group by (id, target_d) and average predictions to assess unique-date performance.
     u_test = test_df.groupby(["id", "target_d"], observed=True).agg(
         obs=("target_units_sold", "first"),
         pred_B=("pred_B", "mean"),
@@ -287,90 +391,122 @@ def evaluate_sku_attention_rule(
     u_test["abs_err_B"] = np.abs(u_test["pred_B"] - u_test["obs"])
     u_test["abs_err_D"] = np.abs(u_test["pred_D"] - u_test["obs"])
     
-    u_top50 = u_test[u_test["id"].isin(top50_ids)]
-    u_rest = u_test[u_test["id"].isin(rest_ids)]
+    u_g1 = u_test[u_test["id"].isin(g1_ids)]
+    u_g2 = u_test[u_test["id"].isin(g2_ids)]
+    u_g3 = u_test[u_test["id"].isin(g3_ids)]
     u_all = u_test
     
-    u_top50_mae_B = float(np.mean(u_top50["abs_err_B"])) if len(u_top50) > 0 else 0.0
-    u_top50_mae_D = float(np.mean(u_top50["abs_err_D"])) if len(u_top50) > 0 else 0.0
-    u_top50_delta_pct = ((u_top50_mae_D - u_top50_mae_B) / u_top50_mae_B * 100.0) if u_top50_mae_B > 0 else 0.0
+    assert len(u_g1) + len(u_g2) + len(u_g3) == len(u_all), (
+        f"Unique-date row mismatch: {len(u_g1)} + {len(u_g2)} + {len(u_g3)} != {len(u_all)}"
+    )
     
-    u_rest_mae_B = float(np.mean(u_rest["abs_err_B"])) if len(u_rest) > 0 else 0.0
-    u_rest_mae_D = float(np.mean(u_rest["abs_err_D"])) if len(u_rest) > 0 else 0.0
-    u_rest_delta_pct = ((u_rest_mae_D - u_rest_mae_B) / u_rest_mae_B * 100.0) if u_rest_mae_B > 0 else 0.0
+    def calc_u_metrics(sub_df: pd.DataFrame, n_series: int, name: str) -> dict:
+        n_rows = len(sub_df)
+        if n_rows == 0:
+            return {"name": name, "n_series": n_series, "n_rows": 0, "mae_B": 0.0, "mae_D": 0.0, "delta_mae": 0.0, "delta_pct": 0.0}
+        m_B = float(np.mean(sub_df["abs_err_B"]))
+        m_D = float(np.mean(sub_df["abs_err_D"]))
+        d_m = m_D - m_B
+        d_pct = (d_m / m_B * 100.0) if m_B > 0 else 0.0
+        return {"name": name, "n_series": n_series, "n_rows": n_rows, "mae_B": m_B, "mae_D": m_D, "delta_mae": d_m, "delta_pct": d_pct}
     
-    u_all_mae_B = float(np.mean(u_all["abs_err_B"])) if len(u_all) > 0 else 0.0
-    u_all_mae_D = float(np.mean(u_all["abs_err_D"])) if len(u_all) > 0 else 0.0
-    u_all_delta_pct = ((u_all_mae_D - u_all_mae_B) / u_all_mae_B * 100.0) if u_all_mae_B > 0 else 0.0
-
+    u_m_g1 = calc_u_metrics(u_g1, len(g1_ids), f"Top-{top_k} Development-Ranked Series (Flagged for Review)")
+    u_m_g2 = calc_u_metrics(u_g2, len(g2_ids), "Other Development-Ranked Series (Unflagged)")
+    u_m_g3 = calc_u_metrics(u_g3, len(g3_ids), "2015-Active Series Without Dev Score (Model B Default)")
+    u_m_all = calc_u_metrics(u_all, n_test_active, "All Active 2015 Holiday Series")
     
-    # Save sensitivity summary CSV
     sensitivity_df = pd.DataFrame([
         {
-            "segment": f"Top {top_k} Review List",
+            "segment": f"Top-{top_k} Development-Ranked Series (Flagged for Review)",
             "eval_level": "Origin-Horizon (Default)",
-            "n_predictions": len(top50_rows),
-            "mae_B": top50_mae_B,
-            "mae_D": top50_mae_D,
-            "delta_D_minus_B": top50_delta_mae,
-            "delta_pct": top50_delta_pct,
+            "n_series": m_g1["n_series"],
+            "n_predictions": m_g1["n_rows"],
+            "mae_B": m_g1["mae_B"],
+            "mae_D": m_g1["mae_D"],
+            "delta_D_minus_B": m_g1["delta_mae"],
+            "delta_pct": m_g1["delta_pct"],
         },
         {
-            "segment": f"Top {top_k} Review List",
+            "segment": f"Top-{top_k} Development-Ranked Series (Flagged for Review)",
             "eval_level": "Unique Target Dates (Averaged)",
-            "n_predictions": len(u_top50),
-            "mae_B": u_top50_mae_B,
-            "mae_D": u_top50_mae_D,
-            "delta_D_minus_B": u_top50_mae_D - u_top50_mae_B,
-            "delta_pct": u_top50_delta_pct,
+            "n_series": u_m_g1["n_series"],
+            "n_predictions": u_m_g1["n_rows"],
+            "mae_B": u_m_g1["mae_B"],
+            "mae_D": u_m_g1["mae_D"],
+            "delta_D_minus_B": u_m_g1["delta_mae"],
+            "delta_pct": u_m_g1["delta_pct"],
         },
         {
-            "segment": "Remaining Catalog",
+            "segment": "Other Development-Ranked Series (Unflagged)",
             "eval_level": "Origin-Horizon (Default)",
-            "n_predictions": len(rest_rows),
-            "mae_B": rest_mae_B,
-            "mae_D": rest_mae_D,
-            "delta_D_minus_B": rest_delta_mae,
-            "delta_pct": rest_delta_pct,
+            "n_series": m_g2["n_series"],
+            "n_predictions": m_g2["n_rows"],
+            "mae_B": m_g2["mae_B"],
+            "mae_D": m_g2["mae_D"],
+            "delta_D_minus_B": m_g2["delta_mae"],
+            "delta_pct": m_g2["delta_pct"],
         },
         {
-            "segment": "Remaining Catalog",
+            "segment": "Other Development-Ranked Series (Unflagged)",
             "eval_level": "Unique Target Dates (Averaged)",
-            "n_predictions": len(u_rest),
-            "mae_B": u_rest_mae_B,
-            "mae_D": u_rest_mae_D,
-            "delta_D_minus_B": u_rest_mae_D - u_rest_mae_B,
-            "delta_pct": u_rest_delta_pct,
+            "n_series": u_m_g2["n_series"],
+            "n_predictions": u_m_g2["n_rows"],
+            "mae_B": u_m_g2["mae_B"],
+            "mae_D": u_m_g2["mae_D"],
+            "delta_D_minus_B": u_m_g2["delta_mae"],
+            "delta_pct": u_m_g2["delta_pct"],
         },
         {
-            "segment": "All Holiday Series",
+            "segment": "2015-Active Series Without Dev Score (Model B Default)",
             "eval_level": "Origin-Horizon (Default)",
-            "n_predictions": len(all_rows),
-            "mae_B": all_mae_B,
-            "mae_D": all_mae_D,
-            "delta_D_minus_B": all_delta_mae,
-            "delta_pct": all_delta_pct,
+            "n_series": m_g3["n_series"],
+            "n_predictions": m_g3["n_rows"],
+            "mae_B": m_g3["mae_B"],
+            "mae_D": m_g3["mae_D"],
+            "delta_D_minus_B": m_g3["delta_mae"],
+            "delta_pct": m_g3["delta_pct"],
         },
         {
-            "segment": "All Holiday Series",
+            "segment": "2015-Active Series Without Dev Score (Model B Default)",
             "eval_level": "Unique Target Dates (Averaged)",
-            "n_predictions": len(u_all),
-            "mae_B": u_all_mae_B,
-            "mae_D": u_all_mae_D,
-            "delta_D_minus_B": u_all_mae_D - u_all_mae_B,
-            "delta_pct": u_all_delta_pct,
+            "n_series": u_m_g3["n_series"],
+            "n_predictions": u_m_g3["n_rows"],
+            "mae_B": u_m_g3["mae_B"],
+            "mae_D": u_m_g3["mae_D"],
+            "delta_D_minus_B": u_m_g3["delta_mae"],
+            "delta_pct": u_m_g3["delta_pct"],
+        },
+        {
+            "segment": "All Active 2015 Holiday Series",
+            "eval_level": "Origin-Horizon (Default)",
+            "n_series": m_all["n_series"],
+            "n_predictions": m_all["n_rows"],
+            "mae_B": m_all["mae_B"],
+            "mae_D": m_all["mae_D"],
+            "delta_D_minus_B": m_all["delta_mae"],
+            "delta_pct": m_all["delta_pct"],
+        },
+        {
+            "segment": "All Active 2015 Holiday Series",
+            "eval_level": "Unique Target Dates (Averaged)",
+            "n_series": u_m_all["n_series"],
+            "n_predictions": u_m_all["n_rows"],
+            "mae_B": u_m_all["mae_B"],
+            "mae_D": u_m_all["mae_D"],
+            "delta_D_minus_B": u_m_all["delta_mae"],
+            "delta_pct": u_m_all["delta_pct"],
         },
     ])
     sensitivity_df.to_csv(out_dir / "sku_attention_unique_date_sensitivity.csv", index=False)
     
     # -------------------------------------------------------------------------
-    # 7. Representative Improvements and Regressions
+    # 10. Representative Improvements and Regressions
     # -------------------------------------------------------------------------
     improved_skus = top_50_df[top_50_df["outcome"] == "IMPROVED"].sort_values("test_delta_mae", ascending=True)
     worsened_skus = top_50_df[top_50_df["outcome"] == "WORSENED"].sort_values("test_delta_mae", ascending=False)
     
     # -------------------------------------------------------------------------
-    # 8. Generate Markdown Report
+    # 11. Generate Markdown Report
     # -------------------------------------------------------------------------
     md_lines = [
         "# SKU Attention Rule: Development Calibration & 2015 Exploratory Evaluation",
@@ -380,27 +516,41 @@ def evaluate_sku_attention_rule(
         "> 1. **Ranking Protocol**: The SKU attention ranking was calibrated **strictly on 2012–2014 development holiday episodes** (`DEV_S2012`, `DEV_S2013`, `DEV_S2014`). Zero 2015 data entered SKU ranking or threshold selection.",
         "> 2. **Exploratory Designation**: Because aggregate 2015 test metrics were inspected in prior research rounds, all 2015 results presented below are **EXPLORATORY**, not an untouched confirmatory test or prospective validation.",
         "> 3. **Operational Meaning of Score**: The attention score represents a **forecast-implied 28-day order quantity difference** (forecast disagreement between Model B and Model D). It is **NOT** an actual inventory order, because the repository does not yet implement stock-on-hand, lead times, safety stocks, or an inventory reorder policy.",
-        "> 4. **Model Preference Disclaimer**: Model D is **NOT** automatically preferable for a selected SKU. A high disagreement score flags an SKU for closer managerial review; it does not prove Model D is more accurate.",
-        "> 5. **No Inventory Claims**: We do not claim that the top-50 rule increases profit or reduces stockouts; those operational outcomes require a subsequent inventory simulation.",
+        "> 4. **Model Preference Disclaimer**: A top-50 flag identifies substantial disagreement between Model B and Model D; **it does NOT authorize switching to Model D**. Disagreement flags an SKU for closer managerial review; it does not prove Model D is more accurate.",
+        "> 5. **Unranked Policy Default**: The unranked 2015-active group's Model B fallback is a prospective policy definition for subsequent inventory simulation, NOT a claim that Model B increased profit.",
+        "> 6. **No Inventory Claims**: We do not claim that the top-50 rule increases profit or reduces stockouts; those operational outcomes require a subsequent inventory simulation.",
         "",
-        "## 1. Attention Rule Formulation & Eligibility",
+        "## 1. Attention Rule Formulation & Population Accounting",
         "",
-        "- **Operational Context**: Store inventory managers cannot review all 3,050 series in the catalog.",
+        "- **Operational Context**: Store inventory managers cannot manually review all 3,050 series in the catalog. A disagreement rule flags the subset where event dynamics differ most between baseline Model B (same-day events) and Model D (event-window dynamics).",
         "- **Eligibility Rule**: A forecast origin $O$ is designated as holiday-relevant if its 28-day forecast window $[O+1, O+28]$ intersects the predeclared Thanksgiving or Christmas analysis window $[-14, +7]$ days. Identified origins: 30 development origins (2012–2014) and 10 test origins (2015).",
-        "- **Full 28-Horizon Summation**: For every active series $s$ and holiday origin $O$, exactly 28 forecast horizons ($h = 1, \\dots, 28$) are verified and summed:",
+        "- **Full 28-Horizon Summation**: For every active series $s$ and holiday origin $O$, exactly 28 forecast horizons ($h = 1, \\dots, 28$) are verified (duplicate and missing horizons strictly prohibited) and summed:",
         "  $$Q_{B}(s, O) = \\sum_{h=1}^{28} \\hat{y}_{B, s, O, h}, \\quad Q_{D}(s, O) = \\sum_{h=1}^{28} \\hat{y}_{D, s, O, h}$$",
         "- **Forecast Disagreement Score**:",
         "  $$\\text{Disagreement}_s = \\frac{1}{|\\mathcal{O}_{\\text{dev}, s}|} \\sum_{O \\in \\mathcal{O}_{\\text{dev}, s}} \\left| Q_{D}(s, O) - Q_{B}(s, O) \\right|$$",
-        f"- **Review List Capacity**: Fixed at the **Top {top_k} highest-disagreement SKU–store pairs** (1.6% of the 3,050 series catalog).",
-        f"- **2015 Active Series Count**: **{n_test_active:,} of 3,050 series** had active sales history during the 2015 holiday origins. The remaining **{n_test_inactive} series** had not yet registered their first positive sale $\\ge 28$ days prior to those origins (late catalog introductions or zero historical sales) and were correctly excluded by the active series protocol.",
+        f"- **Review List Capacity**: Fixed at the **Top {top_k} highest-disagreement SKU–store pairs** (1.6% of the 3,050-series catalog).",
+        "- **Mutually Exclusive & Exhaustive Population Accounting**:",
+        f"  - **Group 1: Top-{top_k} Development-Ranked Series (Flagged for Review)**: **{m_g1['n_series']:,} series** ({m_g1['n_rows']:,} forecast rows). Calibrated strictly on historical 2012–2014 development holiday episodes.",
+        f"  - **Group 2: Other Development-Ranked Series (Unflagged)**: **{m_g2['n_series']:,} series** ({m_g2['n_rows']:,} forecast rows). Active during 2012–2014 development episodes, ranked outside the top {top_k}.",
+        f"  - **Group 3: 2015-Active Series Without Dev Score (Model B Default)**: **{m_g3['n_series']:,} series** ({m_g3['n_rows']:,} forecast rows). Series active in the 2015 holiday evaluation whose first positive sale occurred after the development holiday cutoff (late catalog introductions between late 2014 and 2015). Because they have zero development holiday history, they are not eligible for historical ranking. Their prospective policy assignment for subsequent inventory simulation is the baseline Model B default.",
+        f"  - **Total 2015-Active Holiday Series**: **{m_all['n_series']:,} series** ({m_all['n_rows']:,} forecast rows; sum of Groups 1 + 2 + 3).",
+        f"  - **Sampled Series Without 2015 Holiday Evaluation (Inactive/Unobserved)**: **{n_test_inactive:,} series** (0 holiday rows). Introduced in 2016 (first positive sale at day 1829 or later), so they had not yet had active sales during late-2015 holiday origins.",
+        f"  - **Total Study Population**: **{n_study_series:,} series** ({n_test_active:,} active + {n_test_inactive:,} inactive = {n_study_series:,}).",
         "",
-        "## 2. 2015 Exploratory Performance: Top 50 vs Remaining Catalog vs All Series",
+        "## 2. 2015 Exploratory Performance: Mutually Exclusive Population Accounting",
         "",
-        "| Catalog Segment | Active Series | Model B MAE | Model D MAE | $\\Delta$ (D - B) | Relative $\\Delta$ % | Model B RMSE | Model D RMSE | Model B Bias | Model D Bias |",
-        "|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
-        f"| **Attention Review List (Top {top_k})** | {len(top50_ids)} | {top50_mae_B:.4f} | {top50_mae_D:.4f} | **{top50_delta_mae:+.4f}** | **{top50_delta_pct:+.2f}%** | {top50_rmse_B:.4f} | {top50_rmse_D:.4f} | {top50_bias_B:+.3f} | {top50_bias_D:+.3f} |",
-        f"| **Remaining Catalog (Unreviewed)** | {len(rest_ids):,} | {rest_mae_B:.4f} | {rest_mae_D:.4f} | {rest_delta_mae:+.4f} | {rest_delta_pct:+.2f}% | {rest_rmse_B:.4f} | {rest_rmse_D:.4f} | {rest_bias_B:+.3f} | {rest_bias_D:+.3f} |",
-        f"| **All Active Holiday Series** | {n_test_active:,} | {all_mae_B:.4f} | {all_mae_D:.4f} | {all_delta_mae:+.4f} | {all_delta_pct:+.2f}% | {all_rmse_B:.4f} | {all_rmse_D:.4f} | {all_bias_B:+.3f} | {all_bias_D:+.3f} |",
+        "| Catalog Segment | Active Series | Forecast Rows | Model B MAE | Model D MAE | $\\Delta$ (D - B) | Relative $\\Delta$ % | Model B RMSE | Model D RMSE | Model B Bias | Model D Bias |",
+        "|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
+        f"| **Top-{top_k} Development-Ranked Series (Flagged for Review)** | {m_g1['n_series']:,} | {m_g1['n_rows']:,} | {m_g1['mae_B']:.4f} | {m_g1['mae_D']:.4f} | **{m_g1['delta_mae']:+.4f}** | **{m_g1['delta_pct']:+.2f}%** | {m_g1['rmse_B']:.4f} | {m_g1['rmse_D']:.4f} | {m_g1['bias_B']:+.3f} | {m_g1['bias_D']:+.3f} |",
+        f"| **Other Development-Ranked Series (Unflagged)** | {m_g2['n_series']:,} | {m_g2['n_rows']:,} | {m_g2['mae_B']:.4f} | {m_g2['mae_D']:.4f} | {m_g2['delta_mae']:+.4f} | {m_g2['delta_pct']:+.2f}% | {m_g2['rmse_B']:.4f} | {m_g2['rmse_D']:.4f} | {m_g2['bias_B']:+.3f} | {m_g2['bias_D']:+.3f} |",
+        f"| **2015-Active Series Without Dev Score (Model B Default)** | {m_g3['n_series']:,} | {m_g3['n_rows']:,} | {m_g3['mae_B']:.4f} | {m_g3['mae_D']:.4f} | {m_g3['delta_mae']:+.4f} | {m_g3['delta_pct']:+.2f}% | {m_g3['rmse_B']:.4f} | {m_g3['rmse_D']:.4f} | {m_g3['bias_B']:+.3f} | {m_g3['bias_D']:+.3f} |",
+        f"| **All Active 2015 Holiday Series (Total Active)** | {m_all['n_series']:,} | {m_all['n_rows']:,} | {m_all['mae_B']:.4f} | {m_all['mae_D']:.4f} | {m_all['delta_mae']:+.4f} | {m_all['delta_pct']:+.2f}% | {m_all['rmse_B']:.4f} | {m_all['rmse_D']:.4f} | {m_all['bias_B']:+.3f} | {m_all['bias_D']:+.3f} |",
+        f"| *Sampled Series Without 2015 Holiday Evaluation (Inactive)* | {n_test_inactive:,} | 0 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |",
+        "",
+        "### Accounting Integrity Checks",
+        f"- **Series Count Equality**: {m_g1['n_series']} (Top 50) + {m_g2['n_series']:,} (Other Ranked) + {m_g3['n_series']} (Unranked) = {m_all['n_series']:,} active series (**Verified**).",
+        f"- **Row Count Equality**: {m_g1['n_rows']:,} + {m_g2['n_rows']:,} + {m_g3['n_rows']:,} = {m_all['n_rows']:,} forecast rows (**Verified**).",
+        f"- **Weighted MAE Reproduction**: Row-weighted MAE across the three groups reproduces the all-active Model B MAE ({weighted_mae_B:.6f} == {m_all['mae_B']:.6f}) and Model D MAE ({weighted_mae_D:.6f} == {m_all['mae_D']:.6f}) (**Verified**).",
         "",
         "### Top-50 Outcome Distribution & Effect Sizes",
         f"- **Improved (Model D beats Model B)**: **{n_improved}/{n_top50_eval} series ({pct_improved:.1f}%)**",
@@ -413,14 +563,14 @@ def evaluate_sku_attention_rule(
         "",
         "## 3. Unique Target Date Sensitivity Analysis",
         "",
-        "Because rolling forecast origins evaluate overlapping target dates with varying forecast horizons, we evaluate accuracy when predictions are aggregated by unique calendar target date $(s, t)$:",
+        "Because rolling forecast origins evaluate overlapping target dates with varying forecast horizons, we evaluate accuracy when predictions are aggregated by unique calendar target date $(s, t)$ across all mutually exclusive segments:",
         "",
-        "| Catalog Segment | Evaluation Level | N Predictions | Model B MAE | Model D MAE | $\\Delta$ (D - B) | Relative $\\Delta$ % |",
-        "|---|---|:---:|:---:|:---:|:---:|:---:|",
+        "| Catalog Segment | Evaluation Level | Series Count | Forecast Rows | Model B MAE | Model D MAE | $\\Delta$ (D - B) | Relative $\\Delta$ % |",
+        "|---|---|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
     for r in sensitivity_df.itertuples():
         md_lines.append(
-            f"| {r.segment} | {r.eval_level} | {r.n_predictions:,} | {r.mae_B:.4f} | {r.mae_D:.4f} | {r.delta_D_minus_B:+.4f} | {r.delta_pct:+.2f}% |"
+            f"| {r.segment} | {r.eval_level} | {r.n_series:,} | {r.n_predictions:,} | {r.mae_B:.4f} | {r.mae_D:.4f} | {r.delta_D_minus_B:+.4f} | {r.delta_pct:+.2f}% |"
         )
         
     md_lines.extend([
@@ -456,13 +606,13 @@ def evaluate_sku_attention_rule(
         "",
         "## 6. Top 15 Highest-Priority SKUs on the Attention Review List",
         "",
-        "| Rank | Series ID | Store | Category | Dev Disagreement | 2015 MAE B | 2015 MAE D | 2015 $\\Delta$ (D - B) | Outcome |",
-        "|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
+        "| Rank | Series ID | Store | Category | Dev Disagreement | 2015 MAE B | 2015 MAE D | 2015 $\\Delta$ (D - B) | Outcome | Policy Default |",
+        "|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ])
     for r in top_50_df.head(15).itertuples():
         badge = f"**{r.outcome}**" if r.outcome == "IMPROVED" else (f"*{r.outcome}*" if r.outcome == "WORSENED" else "TIED")
         md_lines.append(
-            f"| {r.attention_rank} | `{r.id}` | {r.store_id} | {r.cat_id} | {r.forecast_disagreement:.2f} | {r.test_mae_B:.4f} | {r.test_mae_D:.4f} | {r.test_delta_mae:+.4f} | {badge} |"
+            f"| {r.attention_rank} | `{r.id}` | {r.store_id} | {r.cat_id} | {r.forecast_disagreement:.2f} | {r.test_mae_B:.4f} | {r.test_mae_D:.4f} | {r.test_delta_mae:+.4f} | {badge} | `{r.policy_default}` |"
         )
         
     report_text = "\n".join(md_lines)
